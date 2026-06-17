@@ -372,9 +372,10 @@ end
 -- ── Shared cast startup function ──────────────────────────────────────────
 local function triggerQuickCast(opts)
     local ignoreUIMode = opts and opts.ignoreUIMode
+    local ignoreWorldPause = opts and opts.ignoreWorldPause
     local uiMode = (ui and ui.activeMode)
     if not uiMode and I.UI and I.UI.getMode then uiMode = I.UI.getMode() end
-    if (uiMode ~= nil and not ignoreUIMode) or core.isWorldPaused() or isCasting then
+    if (uiMode ~= nil and not ignoreUIMode) or (core.isWorldPaused() and not ignoreWorldPause) or isCasting then
         if isCasting then
             debugLog("Input rejected — cast in progress (currentAnimGroup=" ..
                 tostring(currentAnimGroup) .. ")")
