@@ -1,3 +1,6 @@
-PLAYER: scripts/OSSC/ossc_settings.lua
-PLAYER: scripts/OSSC/ossc_player.lua
-GLOBAL: scripts/OSSC/ossc_global.lua
+PLAYER: scripts/ossc/ossc_settings.lua
+PLAYER: scripts/ossc/ossc_player.lua
+GLOBAL: scripts/ossc/ossc_global.lua
+CUSTOM: scripts/ossc/ossc_npc.lua
+CUSTOM: scripts/ossc/ossc_creature.lua
+CUSTOM: scripts/ossc/ossc_actor_items.lua

@@ -1,0 +1,32 @@
+# Labels for Settings `select` items. The stored values are the keys, all
+# defined in scripts/ossc/ossc_penalty.lua. Each label must say exactly what
+# its key does.
+#
+# Quick Cast Chance / Effect Penalty: off, reduce_5 ... reduce_50 (5% steps),
+# skill_based.
+off: "Off"
+reduce_5: "Reduce 5%"
+reduce_10: "Reduce 10%"
+reduce_15: "Reduce 15%"
+reduce_20: "Reduce 20%"
+reduce_25: "Reduce 25%"
+reduce_30: "Reduce 30%"
+reduce_35: "Reduce 35%"
+reduce_40: "Reduce 40%"
+reduce_45: "Reduce 45%"
+reduce_50: "Reduce 50%"
+skill_based: "Skill based"
+#
+# Shield Casting Penalty: off, shield_10 ... shield_100 (the share of the
+# computed slowdown that applies; 50% was "Reduced", 100% was "Full"),
+# skill_based.
+shield_10: "10%"
+shield_20: "20%"
+shield_30: "30%"
+shield_40: "40%"
+shield_50: "50% (Reduced)"
+shield_60: "60%"
+shield_70: "70%"
+shield_80: "80%"
+shield_90: "90%"
+shield_100: "100% (Full)"
