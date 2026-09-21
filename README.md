@@ -1,4 +1,4 @@
-# Oblivion-Style Spell Casting (OSSC) v4.24
+# Oblivion-Style Spell Casting (OSSC) v4.3
 
 **Oblivion-Style Spell Casting** (OSSC) brings modern spellcasting mechanics to OpenMW. It allows you to cast your currently selected spell (and enchanted item spells) using a hotkey or quickkey without needing to switch to spell stance, similar to TES IV: Oblivion.
 
