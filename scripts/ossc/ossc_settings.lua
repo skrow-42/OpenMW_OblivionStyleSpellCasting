@@ -90,7 +90,7 @@ end
 I.Settings.registerPage({
     key         = 'OSSCPage',
     l10n        = 'OSSC',
-    name        = 'Oblivion-Style Spell Casting v4.3',
+    name        = 'Oblivion-Style Spell Casting v4.3a',
     description = 'Settings for the OSSC Mod\n\nSpecial thanks to Dubiousnpc for his fantastic work on OSSC animations'
 })
 
@@ -323,6 +323,7 @@ I.Settings.registerGroup({
         {
             key         = 'CastOnQuickkeys',
             name        = 'Enable Quick Cast Spells from Hotkeys (1-9)',
+            description = 'USE ONLY WITH ENABLED\n[Enable Block / Suppress Spell Stance]',
             renderer    = 'checkbox',
             default     = true
         },

@@ -194,12 +194,36 @@ local LIGHT_ATTACK_GROUPS = {
     "weapononehand", "weapononehand1", "handtohand", "throwweapon",
 }
 
--- Excluded combat group of the currently equipped weapon, if any (nil when
--- the actor has no weapon — or an unexcluded one — in the weapon slot).
-local function getExcludedWeaponGroup()
+-- True for every group the engine uses to put a weapon (or bare hands) into
+-- the ready pose: the light groups plus the heavy ones, i.e. exactly the
+-- groups whose draw and sheathe plays belong to a weapon-ready transition.
+-- One predicate over the two attack lists above, so a duplicated copy of the
+-- names cannot drift out of sync with them.
+local function isWeaponReadyGroup(groupname)
+    for _, g in ipairs(LIGHT_ATTACK_GROUPS) do
+        if groupname == g then return true end
+    end
+    for _, g in ipairs(HEAVY_ATTACK_GROUPS) do
+        if groupname == g then return true end
+    end
+    return false
+end
+
+-- The right-hand weapon slot is also used by the shield suppression path.
+-- Keep this as a single authoritative lookup so nil means hand-to-hand in both
+-- places (rather than accidentally treating a worn shield as a weapon).
+local function getEquippedRightWeapon()
     local equipment = types.Actor.equipment(self)
     local weapon = equipment and equipment[SLOT.CarriedRight]
     if not weapon or not weapon:isValid() or weapon.type ~= types.Weapon then return nil end
+    return weapon
+end
+
+-- Excluded combat group of the currently equipped weapon, if any (nil when
+-- the actor has no weapon — or an unexcluded one — in the weapon slot).
+local function getExcludedWeaponGroup()
+    local weapon = getEquippedRightWeapon()
+    if not weapon then return nil end
     local rec = types.Weapon.record(weapon)
     if rec and rec.type ~= nil then
         return EXCLUDED_WEAPON_TYPE_TO_GROUP[rec.type]
@@ -237,33 +261,8 @@ local function shouldPreserveLightAttackBones()
     return false
 end
 
--- Per-bone-group priorities + blend mask for an OSSC cast. When a light
--- attack owns the weapon arm the cast is restricted to LeftArm (+ legs at
--- WeaponLowerBody) so the swing keeps RightArm/Torso; otherwise the full
--- upper-body mask is used so 2H grip idles cannot pin the casting arm.
-local function buildCastBlendOptions(finalSpeed)
-    local priority = {
-        [BONE.LeftArm]   = PRIO.Hit,
-        [BONE.LowerBody] = PRIO.WeaponLowerBody,
-    }
-    local blendMask = BMASK.LeftArm + BMASK.LowerBody
-    if not shouldPreserveLightAttackBones() then
-        -- Full upper-body claim: beats Weapon-stance idles (idle1h /
-        -- idletwohand / … at Default/Movement) so a two-hander's grip cannot
-        -- pin the casting arm, but stays below PRIORITY.Weapon so a real
-        -- weapon attack that starts mid-cast still wins the bones.
-        priority[BONE.RightArm] = PRIO.Hit
-        priority[BONE.Torso]    = PRIO.Hit
-        blendMask = blendMask + BMASK.RightArm + BMASK.Torso
-    end
-    return {
-        priority  = priority,
-        startKey  = 'start',
-        stopKey   = 'stop',
-        blendMask = blendMask,
-        speed     = finalSpeed,
-    }
-end
+-- buildCastBlendOptions lives below the Stance table: it reads the quickkey
+-- suppression state, so it must be defined after Stance (and debugLog).
 
 -- True while the actor is staggered (hit reactions) or knocked down/out.
 -- Used to cancel an in-flight OSSC cast at launch time.
@@ -487,7 +486,10 @@ local SHIELD_GHOST_VFX_ID = 'OSSC_ShieldGhost'
 -- all reach this check. Never keep a cast's cosmetic shield over a 2H weapon.
 -- Forget the saved shield too, so cleanup cannot overwrite the new loadout.
 local function reconcileShieldWeapon()
-    if getExcludedWeaponGroup() == nil then return false end
+    -- A shield ghost is never needed for hand-to-hand.  With no right-hand
+    -- weapon the vanilla actor keeps the shield presentation, so remove only
+    -- a stale ghost and leave the real shield equipped.
+    if getEquippedRightWeapon() ~= nil and getExcludedWeaponGroup() == nil then return false end
     anim.removeVfx(self, SHIELD_GHOST_VFX_ID)
     suppressedShield = nil
     return true
@@ -497,6 +499,12 @@ end
 -- bone via addVfx so it stays visually in place during the quickcast window.
 local function suppressShieldDuringCast()
     if reconcileShieldWeapon() then return end
+    -- Hand-to-hand is intentionally vanilla-looking: do not unequip a worn
+    -- shield and do not replace it with the OSSC shield ghost VFX.
+    if getEquippedRightWeapon() == nil then
+        anim.removeVfx(self, SHIELD_GHOST_VFX_ID)
+        return
+    end
     if not (Cfg.general and Cfg.general:get('BlockShieldDuringQuickcast')) then return end
     if suppressedShield then return end
     local eq = types.Actor.getEquipment(self)
@@ -856,6 +864,17 @@ local Stance = {
     -- spam press must NOT clear it (handleQuickkeyPress): the cast is still
     -- running and animUnlock is the only place that puts the stance back.
     postCastRestore    = nil,
+    -- Native QuickKey processing happens before OSSC's queued input callback.
+    -- Keep a small, explicit suppression window after the pending press is
+    -- resolved so a delayed stance raise (or the engine's re-raise during an
+    -- OSSC cast) cannot escape the blockade.  This is deliberately separate
+    -- from `slot`: CastOnQuickkeys may be off, and a native raise may arrive
+    -- after the pending press has already been consumed.
+    nativeQuickkeySuppression       = false,
+    nativeQuickkeySuppressionUntil  = 0,
+    nativeQuickkeyRestoreTarget     = nil,
+    nativeQuickkeyWeapon            = nil,
+    prevFrameWeapon                 = nil,
 }
 Stance.lastNonSpellStance = types.Actor.getStance(self)
 if Stance.lastNonSpellStance == STANCE.Spell then
@@ -864,6 +883,60 @@ end
 Stance.prevStance = types.Actor.getStance(self)
 -- (spellStanceAllowed / prevStance / prevSpellKeyDown / prevWeaponKeyDown /
 --  isGrimoireIdlePlaying now live in the Stance table above.)
+
+-- Per-bone-group priorities + blend mask for an OSSC cast. When a light
+-- attack owns the weapon arm the cast is restricted to LeftArm (+ legs at
+-- WeaponLowerBody) so the swing keeps RightArm/Torso; otherwise the full
+-- upper-body mask is used so 2H grip idles cannot pin the casting arm.
+local function buildCastBlendOptions(finalSpeed, animGroup)
+    local priority = {
+        [BONE.LeftArm]   = PRIO.Hit,
+        [BONE.LowerBody] = PRIO.WeaponLowerBody,
+    }
+    local blendMask = BMASK.LeftArm + BMASK.LowerBody
+    -- Relaxed stance (Nothing -- weapon sheathed, nothing readied): no grip
+    -- idle pins the casting arm, so the cast stays on the casting hand alone
+    -- and the weapon arm keeps its idle instead of going stiff for the whole
+    -- cast. A nil stance reads the same way -- nothing readied, nothing to
+    -- beat. (Direct engine read, no pcall: getStance is a plain getter.)
+    local stance = types.Actor.getStance(self)
+    -- A suppressed quickkey cast is still standing in the engine's transient
+    -- Spell raise when the cast starts (the revert lands right after
+    -- triggerQuickCast): judge the pre-press stance the actor actually casts
+    -- in, not the transient raise.
+    if Stance.nativeQuickkeySuppression and Stance.nativeQuickkeyRestoreTarget ~= nil then
+        stance = Stance.nativeQuickkeyRestoreTarget
+    end
+    local preserveAttack = shouldPreserveLightAttackBones()
+    local relaxedStance = stance == nil or stance == STANCE.Nothing
+    -- 'eqcastr' is the Eternal Grimoire's RIGHT-hand cast (the book occupies
+    -- the left hand): it needs RightArm, so the relaxed-stance rule must not
+    -- strip it down to the casting hand. The mid-swing rule above still
+    -- applies to it unchanged.
+    if animGroup == 'eqcastr' then
+        relaxedStance = false
+    end
+    if preserveAttack or relaxedStance then
+        debugLog("Cast blend: LeftArm-only cast (" .. tostring(animGroup)
+            .. " stance=" .. tostring(stance)
+            .. " midSwing=" .. tostring(preserveAttack) .. ")")
+    else
+        -- Full upper-body claim: beats Weapon-stance idles (idle1h /
+        -- idletwohand / ... at Default/Movement) so a two-hander's grip cannot
+        -- pin the casting arm, but stays below PRIORITY.Weapon so a real
+        -- weapon attack that starts mid-cast still wins the bones.
+        priority[BONE.RightArm] = PRIO.Hit
+        priority[BONE.Torso]    = PRIO.Hit
+        blendMask = blendMask + BMASK.RightArm + BMASK.Torso
+    end
+    return {
+        priority  = priority,
+        startKey  = 'start',
+        stopKey   = 'stop',
+        blendMask = blendMask,
+        speed     = finalSpeed,
+    }
+end
 
 -- ── NEW — grimoire idle state ──────────────────────────────────────────────
 local OSSC_PowerCooldowns = {}
@@ -1704,6 +1777,192 @@ end
 function Stance.quickkeyWindowActive()
     return QuickkeyPress.slot ~= nil
         or (Cast.isCasting and Stance.postCastRestore ~= nil)
+        or Stance.nativeQuickkeySuppression
+end
+
+-- Suppress the hardcoded equip/unequip sounds the engine plays when the
+-- stance flips Weapon<->Spell. CharacterController::updateWeaponState plays
+--   downSoundId at unequip (Weapon->Spell) and upSoundId at equip
+--   (Spell->Weapon) whenever !isStillWeapon, and isStillWeapon excludes
+--   Spell/H2H via isWeaponOrToolType. When SuppressSpellStance is on the
+--   weapon must stay visible with no sheath/draw sounds, so every place
+--   that cancels the visual transition also stops these sounds.
+function Stance.suppressWeaponTransitionSounds()
+    -- Keep the list local so only this function closes over it — onUpdate /
+    -- triggerQuickCast are at LuaJIT's 60-upvalue limit.
+    local sounds = {
+        "item weapon blunt up",
+        "item weapon blunt down",
+        "item weapon bow up",
+        "item weapon bow down",
+        "item weapon crossbow up",
+        "item weapon crossbow down",
+        "item weapon longblade up",
+        "item weapon longblade down",
+        "item weapon shortblade up",
+        "item weapon shortblade down",
+        "item weapon spear up",
+        "item weapon spear down",
+        "item armor heavy up",
+        "item armor heavy down",
+        "item armor light up",
+        "item armor light down",
+        "item armor medium up",
+        "item armor medium down",
+        "item ammo up",
+        "item ammo down",
+        -- Title Case variants as they appear in the CS / ESM
+        "Item Weapon Blunt Up",
+        "Item Weapon Blunt Down",
+        "Item Weapon Bow Up",
+        "Item Weapon Bow Down",
+        "Item Weapon Crossbow Up",
+        "Item Weapon Crossbow Down",
+        "Item Weapon LongBlade Up",
+        "Item Weapon LongBlade Down",
+        "Item Weapon ShortBlade Up",
+        "Item Weapon ShortBlade Down",
+        "Item Weapon Spear Up",
+        "Item Weapon Spear Down",
+        "Item Weapon Longblade Up",
+        "Item Weapon Longblade Down",
+        "Item Weapon Shortblade Up",
+        "Item Weapon Shortblade Down",
+        "Item Armor Heavy Up",
+        "Item Armor Heavy Down",
+        "Item Armor Light Up",
+        "Item Armor Light Down",
+        "Item Armor Medium Up",
+        "Item Armor Medium Down",
+        "Item Ammo Up",
+        "Item Ammo Down",
+    }
+    for _, sid in ipairs(sounds) do
+        pcall(core.sound.stopSound3d, sid, self)
+    end
+end
+
+-- A native quick-key is applied before OSSC's input callback.  Once the
+-- callback has established that the press really selected a spell/item, this
+-- bounded window owns every automatic Spell-stance re-raise until the native
+-- transition and (when enabled) the OSSC cast have finished.  Keeping this
+-- state outside QuickkeyPress is important: QuickkeyPress is intentionally
+-- cleared before a cast animation begins, while the engine can still re-raise
+-- Spell stance during that animation.
+local QUICKKEY_STANCE_SUPPRESSION_GRACE = 0.75
+
+local function activateQuickkeyStanceSuppression()
+    if not (Cfg.general and Cfg.general:get('SuppressSpellStance') == true) then return end
+    Stance.nativeQuickkeySuppression      = true
+    Stance.nativeQuickkeySuppressionUntil = core.getSimulationTime() + QUICKKEY_STANCE_SUPPRESSION_GRACE
+    Stance.nativeQuickkeyRestoreTarget    = QuickkeyPress.prePressStance
+        or Stance.lastNonSpellStance
+        or STANCE.Nothing
+    if Stance.nativeQuickkeyRestoreTarget == STANCE.Spell then
+        Stance.nativeQuickkeyRestoreTarget = STANCE.Nothing
+    end
+    -- The previous-frame object is the authoritative weapon.  Do not use the
+    -- post-press equipment table: the native Magic/MagicItem quick-key may
+    -- already have changed the draw state by the time OSSC sees the callback.
+    Stance.nativeQuickkeyWeapon = Stance.prevFrameWeapon
+    -- The engine already started the sheathe and played the down sound in the
+    -- input phase before Lua runs. Stop it immediately.
+    Stance.suppressWeaponTransitionSounds()
+end
+
+local function clearQuickkeyStanceSuppression()
+    Stance.nativeQuickkeySuppression      = false
+    Stance.nativeQuickkeySuppressionUntil = 0
+    Stance.nativeQuickkeyRestoreTarget    = nil
+    Stance.nativeQuickkeyWeapon           = nil
+    Stance.transitionCancelDone           = false
+    Stance.collapsedDrawGroup             = nil
+end
+
+-- A quick-key raises Spell stance in the input phase, BEFORE this script's
+-- input callback, and the mechanics update then starts the weapon sheathe.
+-- The groups that were already playing at the end of the previous frame are
+-- real attacks; anything that appears only after the press is that sheathe.
+function Stance.noteCombatAnimsAtPress()
+    local copy = {}
+    if Stance.prevCombatAnims then
+        for groupName, playing in pairs(Stance.prevCombatAnims) do
+            if playing then copy[groupName] = true end
+        end
+    end
+    Cast.combatAnimsAtPress = copy
+end
+
+-- Set for the one triggerQuickCast a quick-key resolve is about to make, so a
+-- sheathe the engine started for that press is not treated as a player attack.
+-- Consumed at the top of triggerQuickCast, including when the cast is refused
+-- for some other reason, so it cannot leak into the dedicated cast button.
+function Stance.beginQuickkeyCastAttempt()
+    Cast.exemptWeaponTransitionBlock = true
+end
+
+-- The engine re-attaches the weapon only from a draw play ('equip attach', or
+-- its own showWeapons(true) when the set has no such key). Skipping the play
+-- hides the mesh; letting it run from 'equip start' is the visible re-equip.
+-- Start on the attach key so Animation::play fires it immediately (it emits
+-- every text key at the start time), and finish the tail before the frame
+-- renders. A missing or not-before-stop key is left alone: the engine's
+-- fallback then shows the weapon, and the speed still collapses the motion.
+function Stance.collapseEquipPlay(groupname, options)
+    local attachTime, stopTime
+    if anim.getTextKeyTime then
+        local okA, attach = pcall(anim.getTextKeyTime, self, groupname .. ': equip attach')
+        local okS, stop = pcall(anim.getTextKeyTime, self, groupname .. ': equip stop')
+        if okA and type(attach) == 'number' then attachTime = attach end
+        if okS and type(stop) == 'number' then stopTime = stop end
+    end
+    if type(attachTime) == 'number' and attachTime >= 0
+        and type(stopTime) == 'number' and attachTime < stopTime then
+        options.startKey = 'equip attach'
+        options.startkey = 'equip attach'
+    end
+    options.speed = 1000
+    Stance.collapsedDrawGroup = groupname
+    debugLog("[OSSC Stance] Collapsed native weapon draw (no re-equip): " .. groupname)
+    -- The draw play triggers the up sound (Item Weapon ... Up). Silence it.
+    Stance.suppressWeaponTransitionSounds()
+end
+
+-- The press-frame sheathe has already started by the time Lua runs. Cancel it
+-- once, before its 'unequip detach' key, so the mesh never leaves the hand.
+-- Groups that were already playing are the player's attack and are left alone;
+-- the cancel does not repeat, so an attack started during the cast is not
+-- eaten by this (the heavy-attack rule still owns those).
+function Stance.cancelFreshWeaponTransition()
+    if not Stance.nativeQuickkeySuppression or Stance.spellStanceAllowed then return end
+    if Stance.transitionCancelDone then return end
+    Stance.transitionCancelDone = true
+    if isAttackUseHeld() then return end
+    local baseline = Cast.combatAnimsAtPress
+    local function stray(group)
+        if group == Stance.collapsedDrawGroup then return end
+        if not anim.isPlaying(self, group) then return end
+        if baseline and baseline[group] then return end
+        anim.cancel(self, group)
+        debugLog("[OSSC Stance] Cancelled quickkey weapon transition: " .. group)
+    end
+    for _, g in ipairs(LIGHT_ATTACK_GROUPS) do stray(g) end
+    for _, g in ipairs(HEAVY_ATTACK_GROUPS) do stray(g) end
+    stray('shield')
+    -- Also silence any down/up sound that the cancelled play already started.
+    Stance.suppressWeaponTransitionSounds()
+end
+
+-- Restore only an empty right-hand slot.  A player (or another mod) may have
+-- deliberately equipped a different weapon during the cast; never overwrite
+-- that newer choice with the weapon captured before the quick-key.
+local function restoreQuickkeyWeaponIfEmpty()
+    local wanted = Stance.nativeQuickkeyWeapon
+    if not wanted or not wanted.isValid or not wanted:isValid() then return end
+    local equipment = types.Actor.getEquipment(self)
+    if not equipment or equipment[SLOT.CarriedRight] ~= nil then return end
+    equipment[SLOT.CarriedRight] = wanted
+    types.Actor.setEquipment(self, equipment)
 end
 
 -- The stance to put back when a quickkey-raised Spell stance is reverted.
@@ -1716,6 +1975,7 @@ end
 function Stance.quickkeyRevertTarget()
     local target = Stance.postCastRestore
         or QuickkeyPress.prePressStance
+        or Stance.nativeQuickkeyRestoreTarget
         or Stance.lastNonSpellStance
         or STANCE.Nothing
     if target == STANCE.Spell then target = STANCE.Nothing end
@@ -1742,11 +2002,27 @@ local function restoreStanceAfterCast(reason)
     Stance.postCastRestore = nil
     if target == nil then return end
     if Stance.spellStanceAllowed then return end
-    if not (Cfg.general and Cfg.general:get('SuppressSpellStance') == true) then return end
-    if types.Actor.getStance(self) ~= STANCE.Spell then return end
+    if not (Cfg.general and Cfg.general:get('SuppressSpellStance') == true) then
+        clearQuickkeyStanceSuppression()
+        return
+    end
+    -- The update mirror may already have put a late native raise back down.
+    -- The weapon restoration is still needed in that case, even though there
+    -- is no Spell stance left to switch.
+    if types.Actor.getStance(self) ~= STANCE.Spell then
+        restoreQuickkeyWeaponIfEmpty()
+        return
+    end
     if target == STANCE.Spell then target = STANCE.Nothing end
     debugLog("[OSSC Stance] Restoring post-cast stance (" .. tostring(reason or "") .. ")")
     types.Actor.setStance(self, target)
+    -- Restoring Weapon stance would normally play Item Weapon ... Up.
+    -- Keep the weapon visible with no draw sound when suppression is on.
+    Stance.suppressWeaponTransitionSounds()
+    -- The native quick-key may have hidden/cleared the original weapon while
+    -- it raised Spell stance.  Put it back only when the slot is empty; a
+    -- different weapon equipped during the cast is authoritative.
+    restoreQuickkeyWeaponIfEmpty()
     -- Keep the pre-toggle intent reference exact for the next frame.
     Stance.prevStance = target
 end
@@ -1924,6 +2200,12 @@ end
 
 -- ── Shared cast startup function ──────────────────────────────────────────
 local function triggerQuickCast(opts)
+    -- A quick-key resolve sets this for the cast it is about to start. Read it
+    -- here, before any early return, so a refused cast cannot leave it set for
+    -- the dedicated Quick Cast button.
+    local exemptWeaponTransition = Cast.exemptWeaponTransitionBlock == true
+    local transitionBaseline = Cast.combatAnimsAtPress
+    Cast.exemptWeaponTransitionBlock = false
     local ignoreUIMode = opts and opts.ignoreUIMode
     local ignoreWorldPause = opts and opts.ignoreWorldPause
     local uiMode = (ui and ui.activeMode)
@@ -1958,10 +2240,24 @@ local function triggerQuickCast(opts)
             -- can no longer cast mid-shot the way it could when the
             -- follow-through was exempted (it used to leave a gap that held
             -- attacks covered but 1-taps did not).
+            --
+            -- A magic quick-key is the exception, and only for the sheathe the
+            -- engine itself just started. That play is weapontwohand / bow /
+            -- crossbow — the same groups this setting guards — so with the
+            -- setting on (the default) a 2H quick-key never cast at all, while
+            -- a 1H one did (weapononehand is not in the list). A group that
+            -- was already playing before the press is a real attack and still
+            -- blocks, and a held attack charge still blocks below.
             if anim.isPlaying(self, groupName) then
-                debugLog("Cast blocked — combat animation playing: " .. groupName)
-                self:sendEvent('OSSC_CastingState', { isCasting = false })
-                return
+                local causedByQuickkey = exemptWeaponTransition
+                    and not isAttackUseHeld()
+                    and not (transitionBaseline and transitionBaseline[groupName])
+                if not causedByQuickkey then
+                    debugLog("Cast blocked — combat animation playing: " .. groupName)
+                    self:sendEvent('OSSC_CastingState', { isCasting = false })
+                    return
+                end
+                debugLog("Cast allowed through quickkey weapon transition: " .. groupName)
             end
         end
         -- A held attack charge parks the weapon animation on a text key, so
@@ -2298,15 +2594,17 @@ local function triggerQuickCast(opts)
     --   the cast cannot steal those bones and freeze the attack mid-
     --   animation. The cast then plays on LeftArm only (OSSC casts are
     --   left-hand flicks).
+    --   The same LeftArm-only mask is used in relaxed stance (Nothing /
+    --   nil — weapon sheathed, nothing readied): no grip idle pins the
+    --   casting arm there, so claiming RightArm/Torso would only freeze
+    --   the weapon hand stiff for the whole cast. The grimoire's
+    --   right-hand cast ('eqcastr') is exempt — it needs RightArm.
     --   LowerBody = PRIORITY.WeaponLowerBody (1). Below PRIORITY.
     --   Movement (5), so locomotion keeps owning the legs. A biped's
     --   world position comes from the root motion of whatever owns the
     --   LowerBody mask: at Scripted (13) walk/run was paused and the
     --   zero-root-motion cast anim froze movement for the whole cast.
-    local blendOpts = buildCastBlendOptions(finalSpeed)
-    if shouldPreserveLightAttackBones() then
-        debugLog("Cast blend: preserving 1H/H2H attack bones (LeftArm-only cast)")
-    end
+    local blendOpts = buildCastBlendOptions(finalSpeed, animGroup)
     if I.AnimationController and I.AnimationController.playBlendedAnimation then
         I.AnimationController.playBlendedAnimation(animGroup, blendOpts)
         anim.setSpeed(self, animGroup, finalSpeed)
@@ -2326,7 +2624,7 @@ local function triggerQuickCast(opts)
             Cast.currentAnimGroup = fallback
             if I.AnimationController and I.AnimationController.playBlendedAnimation then
                 I.AnimationController.playBlendedAnimation(
-                    fallback, buildCastBlendOptions(finalSpeed))
+                    fallback, buildCastBlendOptions(finalSpeed, fallback))
             end
         end
     end)
@@ -2645,19 +2943,58 @@ local function onUpdate(dt)
             if Stance.quickkeyWindowActive() then
                 debugLog("[OSSC Stance] Late Spell stance raise reverted (update mirror)")
                 types.Actor.setStance(self, Stance.quickkeyRevertTarget())
+                Stance.suppressWeaponTransitionSounds()
             end
         elseif updateStance == STANCE.Weapon or updateStance == STANCE.Nothing then
             Stance.lastNonSpellStance = updateStance
         end
     end
 
+    -- A magic quick-key can be delivered in several engine phases: the native
+    -- selection may raise Spell after onFrame, OSSC may resolve the press on a
+    -- later frame, and the engine can re-raise Spell while the custom cast is
+    -- still playing.  Do not retire the suppression flag merely because the
+    -- pending slot was consumed; keep the bounded window until a stable
+    -- non-Spell state is observed.  A manual stance key always wins.
+    if Stance.nativeQuickkeySuppression then
+        local suppressionSettingOn = Cfg.general
+            and Cfg.general:get('SuppressSpellStance') == true
+        local liveStance = types.Actor.getStance(self)
+        if not suppressionSettingOn or Stance.spellStanceAllowed then
+            clearQuickkeyStanceSuppression()
+        elseif not Cast.isCasting
+            and QuickkeyPress.slot == nil
+            and liveStance ~= STANCE.Spell
+            and core.getSimulationTime() >= Stance.nativeQuickkeySuppressionUntil then
+            clearQuickkeyStanceSuppression()
+        end
+    end
+
+    -- The sheathe started in mechanics, before the stance mirror could put the
+    -- raise back. Stop it once, before 'unequip detach' hides the mesh. Runs
+    -- for a Weapon stance too: the revert may already have landed while the
+    -- sheathe animation is still playing.
+    Stance.cancelFreshWeaponTransition()
+
+    -- While the suppression window is active the engine may still start the
+    -- equip/unequip sounds on a later mechanics update. Keep silencing them
+    -- per-frame until the window closes.
+    if Stance.nativeQuickkeySuppression and not Stance.spellStanceAllowed then
+        Stance.suppressWeaponTransitionSounds()
+    end
+
     -- An attack may be queued by the engine before the animation-controller
     -- callback gets a chance to cancel it. Repeat the cancel while the cast
     -- owns the hands; this closes the same one-frame queueing race as the
     -- control switch and also catches attacks started by another mod.
+    if Stance.collapsedDrawGroup and not anim.isPlaying(self, Stance.collapsedDrawGroup) then
+        Stance.collapsedDrawGroup = nil
+    end
     if shouldBlockHeavyAttack() then
         for _, groupName in ipairs(HEAVY_ATTACK_GROUPS) do
-            if anim.isPlaying(self, groupName) then
+            -- The collapsed quick-key draw is not an attack. Cancelling it
+            -- before the engine finishes the equip state drops the mesh again.
+            if groupName ~= Stance.collapsedDrawGroup and anim.isPlaying(self, groupName) then
                 debugLog("Cancelled " .. groupName .. " attack during quickcast (update)")
                 anim.cancel(self, groupName)
             end
@@ -3916,6 +4253,18 @@ local function updatePrevFrameStore()
     end
     Stance.prevFrameStance    = types.Actor.getStance(self)
     Stance.prevFrameEquipment = snapshotEquipmentIds()
+    local equipment = types.Actor.equipment(self)
+    Stance.prevFrameWeapon = equipment and equipment[SLOT.CarriedRight] or nil
+    -- Attacks already in flight before a quick-key press. The sheathe the
+    -- engine starts for the press is not in this snapshot: mechanics runs
+    -- before this store is refreshed, and the press handler copies it first.
+    local playing = {}
+    local function notePlaying(group)
+        if anim.isPlaying(self, group) then playing[group] = true end
+    end
+    for _, g in ipairs(COMBAT_ANIM_GROUPS) do notePlaying(g) end
+    for _, g in ipairs(LIGHT_ATTACK_GROUPS) do notePlaying(g) end
+    Stance.prevCombatAnims = playing
 end
 
 local function handleQuickkeyPress(slotIndex)
@@ -4000,6 +4349,20 @@ local function handleQuickkeyPress(slotIndex)
     pendingQuickkeyPressTime            = realTimeNow()
     pendingQuickkeyEquipment            = Stance.prevFrameEquipment
     pendingQuickkeyPageSwitch           = hotbarRowSwitchPressed(slotIndex)
+    Stance.noteCombatAnimsAtPress()
+    -- A repeat press (spam) starts a new sheathe. Allow the one-shot cancel
+    -- to run again for groups that were not already an attack.
+    Stance.transitionCancelDone = false
+
+    -- On the normal native path the engine has already raised Spell stance by
+    -- the time this callback runs. Arm immediately when that signal exists so
+    -- any weapon draw/re-equip animation in the same input turn is covered;
+    -- the pending/onUpdate path still handles engines that defer it.
+    if Cfg.general and Cfg.general:get('SuppressSpellStance') == true
+        and not Stance.spellStanceAllowed
+        and types.Actor.getStance(self) == STANCE.Spell then
+        activateQuickkeyStanceSuppression()
+    end
 
     debugLog("[OSSC Hotkey] QuickKey PRESS accepted: slot="
         .. tostring(slotIndex)
@@ -4095,6 +4458,40 @@ if I.AnimationController then
                     return
                 end
             end
+            -- ── Native weapon draw / sheathe requests in the window ─────────
+            -- Reverting the quick-key's Spell raise makes the engine draw the
+            -- weapon again: showWeapons(false), then a play from 'equip start'
+            -- to 'equip stop', and the mesh comes back only at 'equip attach'
+            -- (or from the engine's own showWeapons(true) when the set has no
+            -- such key). Leaving that play untouched — the previous fix, so
+            -- the mesh would not stay hidden — is the visible re-equip. The
+            -- draw is therefore collapsed onto the attach key (see
+            -- Stance.collapseEquipPlay) and returned before any later rule can
+            -- cancel it. It is never skipped: a skipped draw never fires the
+            -- attach key, and the weapon stays gone.
+            --
+            -- The sheathe is still dropped. Dropping it cannot hide the mesh
+            -- (nothing runs its 'unequip detach' key), and a sheathe that is
+            -- already playing is cancelled once from onUpdate before that key.
+            if Stance.nativeQuickkeySuppression
+                and Cfg.general and Cfg.general:get('SuppressSpellStance') == true
+                and (isWeaponReadyGroup(groupname) or groupname == 'shield')
+                and type(options) == 'table' then
+                -- The engine passes the keys as startKey/stopKey; Lua callers
+                -- may use the lowercase spelling.
+                local startKey = tostring(options.startKey or options.startkey or ''):lower()
+                local stopKey  = tostring(options.stopKey or options.stopkey or ''):lower()
+                if startKey == 'equip start' or stopKey == 'equip stop' then
+                    Stance.collapseEquipPlay(groupname, options)
+                    return
+                end
+                if startKey:find('unequip', 1, true) or stopKey:find('unequip', 1, true) then
+                    options.skip = true
+                    debugLog("[OSSC Stance] Vetoed native weapon sheathe animation: " .. groupname)
+                    return
+                end
+            end
+
             -- Hard allow-list: never touch light attack groups, even if a
             -- future change broadens shouldBlockHeavyAttack.
             for _, g in ipairs(LIGHT_ATTACK_GROUPS) do
@@ -4108,9 +4505,13 @@ if I.AnimationController then
                         -- Equip/draw animations use stopkey "equip stop"; attack animations use "stop".
                         -- Without this guard, a bound-weapon spell that auto-equips the weapon
                         -- mid-cast has its draw animation cancelled, leaving the mesh invisible.
-                        local sk = type(options) == 'table' and type(options.stopkey) == 'string'
-                                   and options.stopkey or ''
-                        if sk:find('equip') then
+                        -- The engine passes the key as stopKey (camelCase) — reading only the
+                        -- lowercase spelling never matched an engine play, so this guard never
+                        -- fired and real draws were cancelled. Same rule as ossc_npc.lua
+                        -- isEquipPlay.
+                        local sk = type(options) == 'table'
+                                   and tostring(options.stopKey or options.stopkey or ''):lower() or ''
+                        if sk:find('equip', 1, true) then
                             debugLog("Allowed " .. g .. " equip/draw animation during quickcast (not an attack)")
                             return
                         end
@@ -4168,21 +4569,14 @@ if I.AnimationController then
     -- ready-magic key raise the hands and play the native equip animations and
     -- hand VFX, so nothing may cancel them.
     local function suppressStanceVfx(groupname, key)
-        -- Suppress outside an OSSC quickcast — OSSC casts use their own
-        -- animation groups and are never cancelled here — and also inside one
-        -- while the QUICKKEY window is open: a quickkey press during its own
-        -- cast makes the engine re-ready the stance, and the equip animation
-        -- it re-plays is the whole-actor twitch seen on every spam press. A
-        -- manual spell stance (spellStanceAllowed) is the player's own and is
-        -- never touched.
+        -- The setting suppresses the native stance animation itself.  During
+        -- a quick-key cast the explicit window below also covers the engine's
+        -- repeated re-raise; the dedicated OSSC cast uses different groups.
+        if not (Cfg.general and Cfg.general:get('SuppressSpellStance') == true) then return end
         if Cast.isCasting
             and (Stance.spellStanceAllowed or not Stance.quickkeyWindowActive()) then
             return
         end
-        -- And only while the stance blockade is enabled: with the setting off,
-        -- a natively raised spell stance is the player's own (or the engine's
-        -- quickkey's) doing and plays out exactly like vanilla.
-        if not (Cfg.general and Cfg.general:get('SuppressSpellStance') == true) then return end
         if tostring(key):lower() == 'equip start' then
             anim.cancel(self, groupname)
             debugLog("[OSSC Stance] Suppressed native " .. groupname .. " VFX on equip start")
@@ -4244,6 +4638,9 @@ local function onLoad(data)
     quickkeyPreviousSpellRecordId = Stance.prevFrameSpell
     quickkeyPreviousItemRecordId  = Stance.prevFrameItem
     lastSpellHotkeySlot = nil
+    -- Native stance/equipment transitions are transient and must not survive
+    -- a save load. Start the next quick-key from a fresh suppression window.
+    clearQuickkeyStanceSuppression()
     -- No slot has cast an enchanted item in this session yet; require an
     -- actual magic activation (change / spell stance) before the first cast.
     lastMagicItemHotkeySlot = nil
@@ -4463,6 +4860,8 @@ local function onFrame(dt)
                             self,
                             targetStance
                         )
+                        Stance.suppressWeaponTransitionSounds()
+                        restoreQuickkeyWeaponIfEmpty()
                         -- Keep the pre-toggle intent reference exact: this
                         -- frame returns early below without another refresh.
                         Stance.prevStance = targetStance
@@ -4653,6 +5052,14 @@ local function onFrame(dt)
                 tostring(quickkeyPreviousItemRecordId)
             ))
 
+            -- Arm stance suppression before either the no-cast return or the
+            -- OSSC cast path.  The native quick-key has already run, so this
+            -- is also the point at which we can safely capture the fact that
+            -- this was a magic press rather than a plain weapon/item hotkey.
+            if magicHotkeyActivated and isStanceBlockOn then
+                activateQuickkeyStanceSuppression()
+            end
+
             if not magicHotkeyActivated or not isQuickkeysOn then
                 if not isQuickkeysOn then
                     debugLog("[OSSC Hotkey] Slot " .. tostring(slotIndex)
@@ -4727,6 +5134,7 @@ local function onFrame(dt)
                 lastMagicItemHotkeySlot = activatedSlot
 
                 local castIdBefore = Cast.currentCastId
+                Stance.beginQuickkeyCastAttempt()
                 triggerQuickCast({
                     item           = selectedEnchantedItem,
                     ignoreUIMode   = true,
@@ -4758,6 +5166,7 @@ local function onFrame(dt)
                 lastSpellHotkeySlot = activatedSlot
 
                 local castIdBefore = Cast.currentCastId
+                Stance.beginQuickkeyCastAttempt()
                 triggerQuickCast({
                     spell           = currentSpellRecordId,
                     ignoreUIMode    = true,
@@ -4802,6 +5211,12 @@ local function onFrame(dt)
     -- the player's own doing and is never touched, so the manual stance
     -- can no longer be eaten by a revert racing the stance key across the
     -- onFrame/onUpdate boundary.
+
+    -- Keep weapon equip/unequip sounds silent while the suppression window
+    -- is active (covers late raises and the draw that follows a revert).
+    if Stance.nativeQuickkeySuppression and not Stance.spellStanceAllowed then
+        Stance.suppressWeaponTransitionSounds()
+    end
 
     -- Keep track of last non-spell stance
     if currentStance == STANCE.Weapon or currentStance == STANCE.Nothing then
