@@ -1,14 +1,7 @@
 ---@omw-context player
--- ── PureMultiMark UI compatibility: global exports ─────────────────────────
--- OSSC reuses Pure Multi Mark's recall window and rename dialog modules
--- (scripts/puremultimark/PMM_markWindow.lua, PMM_renameDialog.lua) via
--- `require`. Those modules were written to run inside PMM's own player
--- script, where the engine modules below are plain *globals*. `require`
--- executes a module in THIS script's global environment, so the modules the
--- PMM UI needs must be re-exported here. This block must stay ABOVE the
--- `local` declarations below: once a local of the same name exists, a bare
--- assignment writes to the local instead of the global environment, and the
--- PMM modules fail with "attempt to index global 'core' (a nil value)".
+-- ── PureMultiMark UI compatibility: global exports ──
+-- PMM UI modules run via require in this env and need these as globals.
+-- Must stay ABOVE the locals below, or assignments hit the locals instead.
 core  = require('openmw.core')
 util  = require('openmw.util')
 ui    = require('openmw.ui')
@@ -30,6 +23,7 @@ local storage = require('openmw.storage')
 local I       = require('openmw.interfaces')
 local debug   = require('openmw.debug')
 local nearby  = require('openmw.nearby')
+local vfs     = require('openmw.vfs')
 
 -- ── Hot-path aliases (cod3x) ────────────────────────────────────────────────
 local STANCE     = types.Actor.STANCE
@@ -53,12 +47,20 @@ local Cfg = {
     animSpeed  = storage.playerSection('SettingsOSSC_AnimSpeeds'),
     npc        = storage.playerSection('SettingsOSSC_NPC'),
     pmm        = storage.playerSection('SettingsPureMultiMark'),
+    pmmInstalled = vfs.fileExists('scripts/puremultimark/PMM_markWindow.lua') == true,
     magExp     = storage.playerSection('SettingsMagExp_General'),
     qsKeyboard = storage.playerSection('SettingsQuickSelectKeyboard'),
     qs         = storage.playerSection('SettingsQuickSelect'),
     debugMode  = false,
 }
 Cfg.debugMode = Cfg.general and Cfg.general:get('DebugMode') or false
+
+-- ── Animation data ─────────────────────────────────────────────────────────
+-- The animation groups and weapon classes the cast gates consult, plus the
+-- per-group speed settings, in ONE table. Same reason as Cfg / Cast / PMM /
+-- Stance below: every file-scope local costs the big handlers an upvalue, and
+-- a Lua chunk may only hold 200 of them at all.
+local Anim = {}
 
 -- ── Cached GMST Constants ───────────────────────────────────────────────────
 -- Vanilla Morrowind ships fFatigueSpellBase AND fFatigueSpellMult as 0 — no
@@ -75,12 +77,11 @@ local GMST = {
     sPowerAlreadyUsed     = core.getGMST('sPowerAlreadyUsed') or "You can only use this power once per day.",
     fFatigueSpellBase     = core.getGMST('fFatigueSpellBase') or 0,
     fFatigueSpellMult     = core.getGMST('fFatigueSpellMult') or 0,
-    iMaxActivateDist      = core.getGMST('iMaxActivateDist') or 192,
-    fCombatDistance       = core.getGMST('fCombatDistance') or 128,
-    fHandToHandReach      = core.getGMST('fHandToHandReach') or 1.0,
-    fCombatAngleXY        = core.getGMST('fCombatAngleXY') or 60.0,
-    fCombatAngleZ         = core.getGMST('fCombatAngleZ') or 60.0,
-    sSkillUp              = core.getGMST('sSkillUp') or "Your %s skill has increased to %d.",
+    -- Touch reach / cone / activate distance are read where they are used
+    -- (scripts/ossc/ossc_cast_rules.lua), so the player and the actor scripts
+    -- can never drift apart on the vanilla formula.
+    fTargetSpellMaxSpeed   = core.getGMST('fTargetSpellMaxSpeed') or 1000,
+    sSkillUp               = core.getGMST('sSkillUp') or "Your %s skill has increased to %d.",
 }
 
 -- Quick-cast penalty values and the multiplier each one means are shared with
@@ -122,6 +123,22 @@ end
 -- follower/summon. No-op without FF/FDU.
 local friendlyFire = require('scripts.ossc.ossc_friendlyfire')
 
+-- Moving-target lead for quick-cast projectiles: a Lua clone of the OpenMW
+-- engine's AI spell leading (mwmechanics/aicombat.cpp AimDirToMovingTarget,
+-- AI_REACTION_TIME velocity window, fTargetSpellMaxSpeed bolt speed). Feeds
+-- on crosshair samples taken in onUpdate and is consulted by
+-- processPendingLaunches for target-range casts at a living actor. Pure math
+-- + position tracking lives in scripts/ossc/ossc_target_lead.lua; nothing in
+-- it reads the stance, so leading applies identically to casts started from
+-- Weapon stance or relaxed hands (a quick-cast never starts in Spell stance —
+-- see ossc_cast_rules.quickcastStanceAllowed).
+local targetLead = require('scripts.ossc.ossc_target_lead')
+-- Where an impact's hit statics are drawn (OSSC owns the placement).
+local impactVfx = require('scripts.ossc.ossc_impact_vfx')
+-- Shared cast rules: the Spell-stance gate and the modder cast-veto hooks live
+-- there so the player, NPC and item casters cannot drift apart.
+local castRulesModule = require('scripts.ossc.ossc_cast_rules')
+
 -- ── Stagger / knockdown interruption rules ─────────────────────────────────
 -- Vanilla cancels a cast when the caster is staggered; OSSC must do the same.
 --   * KNOCK_GROUPS   — every animation group with 'knock' in its name. While
@@ -131,17 +148,17 @@ local friendlyFire = require('scripts.ossc.ossc_friendlyfire')
 --                      OSSC cast is cancelled instead of launching.
 -- The lists below are also checked again at launch time (the 'release' moment)
 -- so a stagger that lands mid-animation cancels the spell with no cost.
-local KNOCK_GROUPS = {
+Anim.KNOCK_GROUPS = {
     "knockdown", "knockout", "swimknockdown", "swimknockout", "hit1", "hit2", "hit3", "hit4", "hit5",
     "swimhit1", "swimhit2", "swimhit3",
 }
 
-local STAGGER_GROUPS = {
+Anim.STAGGER_GROUPS = {
         "hit1", "hit2", "hit3", "hit4", "hit5",
     "swimhit1", "swimhit2", "swimhit3",
 }
 
-local INCAPACITATED_GROUPS = {
+Anim.INCAPACITATED_GROUPS = {
     "spellcast", "knockdown", "knockout", "swimknockout", "swimknockdown",
     "hit1", "hit2", "hit3", "hit4", "hit5",
     "swimhit1", "swimhit2", "swimhit3",
@@ -153,7 +170,7 @@ local INCAPACITATED_GROUPS = {
 -- weapontwowide — WeaponTwoWide: Chop / Slash / Thrust
 -- bowandarrow   — BowAndArrow: Shoot (draw + release)
 -- crossbow      — Crossbow: Shoot (aim + release)
-local COMBAT_ANIM_GROUPS = {
+Anim.COMBAT_ANIM_GROUPS = {
     "shield", "weapontwohand", "weapontwowide", "bowandarrow", "crossbow",
 }
 
@@ -163,7 +180,7 @@ local COMBAT_ANIM_GROUPS = {
 -- group check alone would let a quick-cast through the hold. When the attack
 -- button is held with one of these weapons equipped, quick-casting is
 -- therefore blocked as well.
-local EXCLUDED_WEAPON_TYPE_TO_GROUP = {
+Anim.EXCLUDED_WEAPON_TYPE_TO_GROUP = {
     [types.Weapon.TYPE.LongBladeTwoHand]  = "weapontwohand",
     [types.Weapon.TYPE.BluntTwoClose]     = "weapontwohand",
     [types.Weapon.TYPE.AxeTwoHand]        = "weapontwohand",
@@ -178,7 +195,7 @@ local EXCLUDED_WEAPON_TYPE_TO_GROUP = {
 -- are the attack groups of two-handed melee and ranged weapons — the same
 -- heavy weapons guarded by Block Quick Cast During Combat Animations. Shield
 -- blocking is not an attack, so 'shield' is intentionally left out.
-local HEAVY_ATTACK_GROUPS = {
+Anim.HEAVY_ATTACK_GROUPS = {
     "weapontwohand", "weapontwowide", "bowandarrow", "crossbow",
 }
 
@@ -190,7 +207,7 @@ local HEAVY_ATTACK_GROUPS = {
 -- attack even though its priority is higher on paper. Detect these groups so
 -- the cast can leave the swinging arm alone, and so no cancel path ever
 -- touches them. 'weapononehand1' is the ReAnimation alternating 1H group.
-local LIGHT_ATTACK_GROUPS = {
+Anim.LIGHT_ATTACK_GROUPS = {
     "weapononehand", "weapononehand1", "handtohand", "throwweapon",
 }
 
@@ -200,18 +217,16 @@ local LIGHT_ATTACK_GROUPS = {
 -- One predicate over the two attack lists above, so a duplicated copy of the
 -- names cannot drift out of sync with them.
 local function isWeaponReadyGroup(groupname)
-    for _, g in ipairs(LIGHT_ATTACK_GROUPS) do
+    for _, g in ipairs(Anim.LIGHT_ATTACK_GROUPS) do
         if groupname == g then return true end
     end
-    for _, g in ipairs(HEAVY_ATTACK_GROUPS) do
+    for _, g in ipairs(Anim.HEAVY_ATTACK_GROUPS) do
         if groupname == g then return true end
     end
     return false
 end
 
--- The right-hand weapon slot is also used by the shield suppression path.
--- Keep this as a single authoritative lookup so nil means hand-to-hand in both
--- places (rather than accidentally treating a worn shield as a weapon).
+-- Single lookup: nil means hand-to-hand (a worn shield is not a weapon).
 local function getEquippedRightWeapon()
     local equipment = types.Actor.equipment(self)
     local weapon = equipment and equipment[SLOT.CarriedRight]
@@ -219,14 +234,13 @@ local function getEquippedRightWeapon()
     return weapon
 end
 
--- Excluded combat group of the currently equipped weapon, if any (nil when
--- the actor has no weapon — or an unexcluded one — in the weapon slot).
+-- Excluded combat group of the equipped weapon, or nil.
 local function getExcludedWeaponGroup()
     local weapon = getEquippedRightWeapon()
     if not weapon then return nil end
     local rec = types.Weapon.record(weapon)
     if rec and rec.type ~= nil then
-        return EXCLUDED_WEAPON_TYPE_TO_GROUP[rec.type]
+        return Anim.EXCLUDED_WEAPON_TYPE_TO_GROUP[rec.type]
     end
     return nil
 end
@@ -241,7 +255,7 @@ end
 -- active upper-body motion. Used to keep the cast off the swinging arm so a
 -- mid-swing quickcast cannot freeze the attack mid-animation.
 local function isLightAttackPlaying()
-    for _, groupName in ipairs(LIGHT_ATTACK_GROUPS) do
+    for _, groupName in ipairs(Anim.LIGHT_ATTACK_GROUPS) do
         if anim.isPlaying(self, groupName) then return true end
     end
     return false
@@ -267,10 +281,10 @@ end
 -- True while the actor is staggered (hit reactions) or knocked down/out.
 -- Used to cancel an in-flight OSSC cast at launch time.
 local function isStaggeredOrKnocked()
-    for _, groupName in ipairs(KNOCK_GROUPS) do
+    for _, groupName in ipairs(Anim.KNOCK_GROUPS) do
         if anim.isPlaying(self, groupName) then return true end
     end
-    for _, groupName in ipairs(STAGGER_GROUPS) do
+    for _, groupName in ipairs(Anim.STAGGER_GROUPS) do
         if anim.isPlaying(self, groupName) then return true end
     end
     return false
@@ -282,33 +296,23 @@ local function debugLog(msg)
     end
 end
 
--- ── State ─────────────────────────────────────────────────────────────────
--- NOTE: shared script state intentionally lives inside tables (Cast / PMM /
--- Stance) instead of plain file-scope locals. OpenMW's Lua (LuaJIT) allows a
--- function at most 60 upvalues, and the big handlers (onUpdate,
--- triggerQuickCast) close over nearly all of this state — every new local
--- here costs one upvalue in each of those functions. Please add new shared
--- state as a field of one of these tables rather than as a new `local`.
+-- ── State ──
+-- Shared state lives in tables (Cast/PMM/Stance): LuaJIT 60-upvalue limit.
+-- Add new shared state as table fields, not new locals.
 local Cast = {
     isCasting           = false,
     hasFiredThisCast    = false,
     pendingLaunches     = {},
     currentSpell        = nil,
     hasQueuedLaunch     = false,
-    -- Resources for the cast in flight: set once by handleCastCosts() when the
-    -- cast starts and copied into every queued launch ('release' key, safety
-    -- launch timer, deferred PMM recall). A launch must never re-read it from
-    -- Cast: by the time a queued launch resolves, Cast already belongs to
-    -- whatever happened next.
+    -- Set once by handleCastCosts and copied into each queued launch;
+    -- launches must never re-read it from Cast.
     currentIsPaid       = false,
-    -- Toast text for a refused cast (nil when the casting framework already
-    -- told the player itself).
+    -- nil when the casting framework already told the player.
     currentCostMessage  = nil,
-    -- The payment transaction is latched independently of the animation/audio
-    -- latch. Rapid re-entry must never debit the same active cast twice.
+    -- Latched separately from anim/audio: never debit the same cast twice.
     costPaidCastId      = nil,
-    -- Cast id whose 'start' text key was already handled (cast sound + cast
-    -- VFX + safety launch timer). Latches those to exactly one per quickcast.
+    -- Latches start sound/VFX/safety timer to once per quickcast.
     startKeyCastId      = nil,
     spellvfx            = false,
     isGlowActive        = false,
@@ -324,15 +328,7 @@ local Cast = {
     -- One-time flag for the outdated-NGarde warning in setNgardeParryControl.
     ngardeMissingWarned = false,
 }
--- QuickKey press tracking lives at the TOP of the file on purpose: the
--- onUpdate stance-suppression mirror (defined further down, before the hotkey
--- handler section) attributes late Spell-stance raises to a pending quickkey
--- press, so the mirror and the handlers below must share one state table — no
--- shadowed duplicates between the two sections. The pending-press fields live
--- in the ONE table below for the same 60-upvalue reason as the Cast / PMM /
--- Stance tables: every file-scope local a function references costs it an
--- upvalue, and the big onUpdate handler is nearly at LuaJIT's limit — a
--- single shared table keeps the mirror at one upvalue instead of four.
+-- Shared with the onUpdate stance mirror; one table for the upvalue limit.
 local QuickkeyPress = {
     slot                  = nil,   -- QuickKey slot index of the pending press
     timer                 = 0,     -- countdown; the press resolves when it hits 0
@@ -343,9 +339,9 @@ local QuickkeyPress = {
     cooldownActive        = false, -- held for the entire quick-slot cast animation
     blockedByCooldown     = false, -- this press only exists to suppress native stance
 }
-local quickkeyPreviousSpellRecordId        = nil   -- recordId (stable across loads)
-local quickkeyPreviousItemRecordId         = nil   -- recordId (stable across loads)
-local lastMagicItemHotkeySlot = nil
+QuickkeyPress.prevSpellRecordId = nil    -- recordId (stable across loads)
+QuickkeyPress.prevItemRecordId  = nil    -- recordId (stable across loads)
+QuickkeyPress.lastMagicItemSlot = nil    -- last magic-item hotkey slot pressed
 -- ── Pure Multi Mark Compatibility State & Functions ─────────────────────────
 -- (One table for the same 60-upvalue reason as the Cast table above.)
 local PMM = {
@@ -360,25 +356,9 @@ local PMM = {
     pmmUiClosedAt           = nil,    -- see the comment block below
     pmmUiOpenedAt           = nil,    -- see the comment block below
 }
--- After-cast window: when set, this recall cast plays its FULL cast animation
--- and the PMM multi mark window opens only after the casting happens — on the
--- animation's 'release' text key (the moment the spell is launched), with a
--- fallback to the 'stop' key and to the safety unlock timer for animation
--- groups that omit those keys (e.g. qcsnap only carries 'start'/'release')
--- — instead of at cast start. The recall launch is held back at the
--- 'release' text key and queued only when the player picks a mark; leaving
--- the window any other way cancels the recall (the vanilla mark must not go
--- through while this option is enabled).
--- (pmmDeferredRecall now lives in the PMM table above.)
+-- After-cast window: recall launch held at 'release' until a mark is picked;
+-- any other exit cancels the recall (vanilla mark must not go through).
 local resolvePMMRecall        -- assigned below, once animUnlock is defined
--- Simulation time at which the PMM recall UI stopped waiting for input.
--- Safety timers use this to give the resumed cast animation its normal
--- grace window instead of force-cleaning up the moment the UI closes.
--- (pmmUiClosedAt now lives in the PMM table above.)
--- Simulation time at which OSSC requested the PMM recall UI. I.UI.setMode is
--- processed by the engine on a later UI update, so this gives that transition
--- a short grace period before onUpdate treats a still-nil mode as closed.
--- (pmmUiOpenedAt now lives in the PMM table above.)
 
 local function isPMMCompatEnabled()
     local val = Cfg.general and Cfg.general:get('PureMultiMarkCompat')
@@ -403,8 +383,8 @@ end
 --      instead of playing over the cast.
 -- Both are reconciled every frame (equip swaps / setting flips / cast end
 -- take effect immediately).
-local weaponAttackLockActive = false
-local combatBlockActive      = false
+Cast.weaponAttackLockActive = false
+Cast.combatBlockActive      = false
 
 -- True while a quickcast is in progress and its cast animation is meant to be
 -- occupying the hands. This is the "hand is free of the weapon" gate: while
@@ -424,22 +404,13 @@ local function canUseFightingControlSwitch()
     return input and input.setControlSwitch and input.CONTROL_SWITCH
 end
 
--- True when the BlockWeaponDuringQuickcast setting is on, a quickcast is
--- currently playing on the hands, and an excluded (2H / bow / crossbow)
--- weapon is equipped — the condition under which heavy-weapon attacks must be
--- prevented. This rule has higher priority than AllowAttackingWhileCasting:
--- that setting may keep one-handed / hand-to-hand attacks usable mid-cast, but
--- the heavy excluded weapon classes must still be blocked while quick-casting.
--- Shared by the control-switch lock, the coarse combat-block fallback, and the
--- animation-cancel handler.
+-- Heavy-weapon block condition; takes priority over AllowAttackingWhileCasting.
 local BOUND_2H_EFFECT_IDS = {
     [core.magic.EFFECT_TYPE.BoundSpear]     = true,
     [core.magic.EFFECT_TYPE.BoundBattleAxe] = true,
-    [core.magic.EFFECT_TYPE.BoundLongsword] = true,
     [core.magic.EFFECT_TYPE.BoundLongbow]   = true,
     ['boundspear']     = true,
     ['boundbattleaxe'] = true,
-    ['boundlongsword'] = true,
     ['boundlongbow']   = true,
 }
 
@@ -477,21 +448,28 @@ local function shouldBlockHeavyAttack()
     return getExcludedWeaponGroup() ~= nil
 end
 
-local suppressedBlockSkill = nil  -- unused, kept as placeholder so onSave/onLoad calls are harmless
+Cast.suppressedBlockSkill = nil  -- unused, kept as placeholder so onSave/onLoad calls are harmless
 
-local suppressedShield    = nil   -- shield item unequipped during cast
-local SHIELD_GHOST_VFX_ID = 'OSSC_ShieldGhost'
+Cast.suppressedShield    = nil   -- shield item unequipped during cast
+Cast.shieldGhostVfxId    = 'OSSC_ShieldGhost'
 
 -- Equipment is authoritative: bound spells, inventory equips and other mods
 -- all reach this check. Never keep a cast's cosmetic shield over a 2H weapon.
 -- Forget the saved shield too, so cleanup cannot overwrite the new loadout.
 local function reconcileShieldWeapon()
-    -- A shield ghost is never needed for hand-to-hand.  With no right-hand
-    -- weapon the vanilla actor keeps the shield presentation, so remove only
-    -- a stale ghost and leave the real shield equipped.
-    if getEquippedRightWeapon() ~= nil and getExcludedWeaponGroup() == nil then return false end
-    anim.removeVfx(self, SHIELD_GHOST_VFX_ID)
-    suppressedShield = nil
+    -- No ghost for hand-to-hand or a 2H weapon. If the right hand emptied
+    -- mid-cast (weapon broke, bound weapon expired), give the hidden shield back.
+    local rightWeapon = getEquippedRightWeapon()
+    if rightWeapon ~= nil and getExcludedWeaponGroup() == nil then return false end
+    anim.removeVfx(self, Cast.shieldGhostVfxId)
+    if rightWeapon == nil and Cast.suppressedShield and Cast.suppressedShield:isValid() then
+        local eq = types.Actor.getEquipment(self)
+        if not eq[SLOT.CarriedLeft] then
+            eq[SLOT.CarriedLeft] = Cast.suppressedShield
+            types.Actor.setEquipment(self, eq)
+        end
+    end
+    Cast.suppressedShield = nil
     return true
 end
 
@@ -499,37 +477,41 @@ end
 -- bone via addVfx so it stays visually in place during the quickcast window.
 local function suppressShieldDuringCast()
     if reconcileShieldWeapon() then return end
-    -- Hand-to-hand is intentionally vanilla-looking: do not unequip a worn
-    -- shield and do not replace it with the OSSC shield ghost VFX.
-    if getEquippedRightWeapon() == nil then
-        anim.removeVfx(self, SHIELD_GHOST_VFX_ID)
-        return
-    end
-    if not (Cfg.general and Cfg.general:get('BlockShieldDuringQuickcast')) then return end
-    if suppressedShield then return end
+    if Cast.suppressedShield then return end
     local eq = types.Actor.getEquipment(self)
     local item = eq[SLOT.CarriedLeft]
-    if not (item and item.type == types.Armor
-        and types.Armor.record(item).type == types.Armor.TYPE.Shield) then
-        -- No shield equipped at cast time: this cast must not show any shield
-        -- VFX. Remove a ghost left over from an earlier cast instead of
-        -- letting it reappear during this one.
-        anim.removeVfx(self, SHIELD_GHOST_VFX_ID)
+    local armorRec = item and item.type == types.Armor
+        and types.Armor.record(item) or nil
+    local isShield = armorRec ~= nil and armorRec.type == types.Armor.TYPE.Shield
+    -- One shared rule for both scripts (ossc_cast_rules.shouldGhostShield):
+    -- the ghost VFX belongs to a cast that frees a WEAPON grip. Hand-to-hand
+    -- (nothing in the right hand) is intentionally vanilla-looking: the shield
+    -- stays on and no shield mesh ever appears next to the fists. A two-handed
+    -- weapon / bow / crossbow already lost the shield (reconcileShieldWeapon
+    -- above), and a cast with no shield has nothing to hide. Never leave a
+    -- ghost behind from an earlier cast either.
+    if not require('scripts.ossc.ossc_cast_rules').shouldGhostShield({
+        rightWeapon    = getEquippedRightWeapon(),
+        excludedWeapon = getExcludedWeaponGroup() ~= nil,
+        shield         = isShield and item or nil,
+        setting        = (Cfg.general
+                          and Cfg.general:get('BlockShieldDuringQuickcast')) == true,
+    }) then
+        anim.removeVfx(self, Cast.shieldGhostVfxId)
         return
     end
-    local armorRec = types.Armor.record(item)
     -- Attach the shield mesh as a looping VFX on the left-hand bone so the
     -- player still sees it while the equipment slot is vacant.
     if armorRec.model and armorRec.model ~= '' then
         anim.addVfx(self, armorRec.model, {
             loop            = true,
-            vfxId           = SHIELD_GHOST_VFX_ID,
+            vfxId           = Cast.shieldGhostVfxId,
             boneName        = 'Bip01 L Hand',
             useAmbientLight = false,
         })
         debugLog('Shield ghost VFX added: ' .. armorRec.model)
     end
-    suppressedShield = item
+    Cast.suppressedShield = item
     eq[SLOT.CarriedLeft] = nil
     types.Actor.setEquipment(self, eq)
     debugLog('Shield unequipped for blocking suppression: ' .. tostring(item.recordId))
@@ -538,23 +520,21 @@ end
 -- Remove the ghost VFX and re-equip the shield after the cast ends.
 local function restoreShieldAfterCast()
     reconcileShieldWeapon()
-    anim.removeVfx(self, SHIELD_GHOST_VFX_ID)
-    if suppressedShield then
-        if suppressedShield:isValid() then
+    anim.removeVfx(self, Cast.shieldGhostVfxId)
+    if Cast.suppressedShield then
+        if Cast.suppressedShield:isValid() then
             local eq = types.Actor.getEquipment(self)
             if not eq[SLOT.CarriedLeft] then
-                eq[SLOT.CarriedLeft] = suppressedShield
+                eq[SLOT.CarriedLeft] = Cast.suppressedShield
                 types.Actor.setEquipment(self, eq)
-                debugLog('Shield re-equipped after quickcast: ' .. tostring(suppressedShield.recordId))
+                debugLog('Shield re-equipped after quickcast: ' .. tostring(Cast.suppressedShield.recordId))
             end
         end
-        suppressedShield = nil
+        Cast.suppressedShield = nil
     end
 end
 
--- True when the BlockShieldDuringQuickcast setting is on and a quickcast is in
--- progress. When true, any "shield" (block) animation the player starts will be
--- cancelled by both the addPlayBlendedAnimationHandler and the onUpdate loop.
+-- Shield block anims are cancelled by both the anim handler and onUpdate.
 local function shouldBlockShield()
     if not (Cfg.general and Cfg.general:get('BlockShieldDuringQuickcast')) then return false end
     return isHandFreeDuringCast()
@@ -563,14 +543,14 @@ end
 local function setWeaponAttackLock(locked)
     if not canUseFightingControlSwitch() then return end
     input.setControlSwitch(input.CONTROL_SWITCH.Fighting, not locked)
-    weaponAttackLockActive = locked
+    Cast.weaponAttackLockActive = locked
     debugLog("Weapon attack lock " .. (locked and "engaged" or "released"))
 end
 
 local function setCombatBlock(locked)
     if not I.Controls or not I.Controls.overrideCombatControls then return end
     I.Controls.overrideCombatControls(locked)
-    combatBlockActive = locked
+    Cast.combatBlockActive = locked
     debugLog("Combat block " .. (locked and "engaged" or "released"))
 end
 
@@ -579,8 +559,7 @@ local function shouldHoldCombatBlock()
     if not (Cfg.general and Cfg.general:get('AllowAttackingWhileCasting')) then
         return true
     end
-    -- BlockWeaponDuringQuickcast has priority over AllowAttackingWhileCasting.
-    -- Bound 2H weapon spells are exempted so the weapon mesh initializes cleanly.
+    -- Priority over AllowAttackingWhileCasting; bound 2H spells exempt so the mesh initialises.
     if not Cast.isBound2HWeaponCast
         and Cfg.general:get('BlockWeaponDuringQuickcast') == true
         and getExcludedWeaponGroup() ~= nil then
@@ -591,27 +570,21 @@ end
 
 local function reconcileWeaponAttackLock()
     local wantLock = shouldBlockHeavyAttack()
-    if wantLock ~= weaponAttackLockActive then
+    if wantLock ~= Cast.weaponAttackLockActive then
         setWeaponAttackLock(wantLock)
     end
 end
 
 local function reconcileCombatBlock()
     local wantLock = shouldHoldCombatBlock()
-    if wantLock ~= combatBlockActive then
+    if wantLock ~= Cast.combatBlockActive then
         setCombatBlock(wantLock)
     end
 end
 
--- NGarde exclusion must cover both input orderings: the start gate below
--- rejects cast-after-parry, while this external controller state rejects
--- parry-after-cast for the exact lifetime of the quickcast. No frame polling is
--- needed; cast start/cleanup are the state transitions.
+-- NGarde exclusion: start gate rejects cast-after-parry, this rejects parry-after-cast.
 local function setNgardeParryControl(active)
-    -- The setting check is deliberately truthy (not `== true`) to match the
-    -- cast-start gate in triggerQuickCast: any truthy stored value must engage
-    -- the lock, otherwise casts get refused while parrying but a guard can
-    -- still be raised over a cast already in progress.
+    -- Truthy check must match triggerQuickCast's gate.
     local settingOn = Cfg.general and Cfg.general:get('BlockDuringNGardeParry')
     active = (active == true) and (settingOn and true or false)
     local ngarde = I.NGardePlayer
@@ -624,10 +597,7 @@ local function setNgardeParryControl(active)
         debugLog('NGarde parry control ' .. (active and 'engaged (guard raises blocked during cast)' or 'released'))
     else
         Cast.ngardeParryControlActive = false
-        -- A wholly absent interface just means NGarde is not installed (stay
-        -- silent, as before). But an interface WITHOUT externalParryControl
-        -- means an outdated NGarde that cannot honor the lock the setting
-        -- promises — warn once so the user knows to update it.
+        -- Interface without externalParryControl = outdated NGarde: warn once.
         if active and ngarde ~= nil and not Cast.ngardeMissingWarned then
             Cast.ngardeMissingWarned = true
             print('[OSSC] WARNING: Block Quick Cast During NGarde Parry is on, but this NGarde version has no externalParryControl — guards can still rise mid-cast. Update NGarde.')
@@ -636,7 +606,7 @@ local function setNgardeParryControl(active)
 end
 
 local function isPMMInstalled()
-    return Cfg.pmm ~= nil
+    return Cfg.pmmInstalled == true
 end
 
 local function getPMMMaxMarks()
@@ -727,16 +697,12 @@ function selectedMark(id)
     if I.UI and I.UI.setMode then I.UI.setMode() end
     if Cast.isCasting then
         if id and id > 0 and resolvePMMRecall then
-            -- Player picked a multi mark destination. The cast animation has
-            -- already released (after-cast window), so resolve the held
-            -- recall right away: queue the launch + release the cast lock.
+            -- Mark picked: resolve the held recall now.
             PMM.pmmSelectedDestination = id
             PMM.pmmVanillaRecall = false
             resolvePMMRecall('PMM mark selected')
         else
-            -- "Latest" / no mark picked: with Pure Multi Mark Compatibility
-            -- enabled the vanilla mark must NOT go through — cancel the
-            -- recall instead of falling back to a standard Recall.
+            -- No mark picked: cancel; the vanilla mark must not go through.
             PMM.pmmSelectedDestination = nil
             PMM.pmmVanillaRecall = false
             PMM.pmmCancelled = true
@@ -754,9 +720,7 @@ function cancelCasting()
     if I.UI and I.UI.setMode then I.UI.setMode() end
 end
 
--- Destroy the PMM recall window if it is currently alive. The function is
--- defined by PMM_markWindow when it loads, so guard against a missing/stale
--- global (e.g. when the window failed to load).
+-- Guard: the global is defined by PMM_markWindow and may be missing.
 local function destroyPMMWindow()
     if destroyTeleportWindow then destroyTeleportWindow() end
 end
@@ -773,9 +737,7 @@ local function openPMMRecallWindow()
     PMM.pmmUiClosedAt = nil
     PMM.pmmUiOpenedAt = core.getSimulationTime()
 
-    -- PMM_markWindow reads these globals from the player-script environment.
-    -- (The engine-module globals — core/util/ui/async/input/v2 — are exported
-    -- at the very top of this file, before the local declarations.)
+    -- PMM_markWindow reads these globals (engine modules are exported at file top).
     saveData = { locations = PMM.pmmLocations }
     playerSection = Cfg.pmm
     LIST_ENTRIES = playerSection and playerSection:get('LIST_ENTRIES') or 15
@@ -786,9 +748,7 @@ local function openPMMRecallWindow()
         if not ok then
             debugLog('[OSSC PMM] Failed to load PMM_renameDialog: ' .. tostring(rd))
         end
-        -- PMM_markWindow calls renameDialog.isOpen()/close() unconditionally,
-        -- so provide inert stubs instead of leaving the global nil. Renaming
-        -- simply becomes unavailable.
+        -- PMM_markWindow calls renameDialog unconditionally: inert stubs.
         renameDialog = {
             isOpen = function() return false end,
             close  = function() end,
@@ -824,57 +784,44 @@ local function openPMMRecallWindow()
         PMM.isWaitingForPMMInput = false
         PMM.pmmUiClosedAt = core.getSimulationTime()
         PMM.pmmUiOpenedAt = nil
-        -- pmmVanillaRecall stays false: the caller (the release/stop
-        -- handler) cancels the recall — the vanilla mark must not go through.
+        -- Caller cancels the recall; the vanilla mark must not go through.
         if I.UI and I.UI.setMode then I.UI.setMode() end
     end
 end
 
--- ── Stance suppression for CastOnQuickkeys / SuppressSpellStance settings ──
--- (One table for the same 60-upvalue reason as the Cast table above.)
+-- ── Stance suppression (CastOnQuickkeys / SuppressSpellStance) ──
 local Stance = {
     lastNonSpellStance = nil,   -- initialised just below
+    -- Weapon DRAW tracker shared with the actor script: a 2H draw and a 2H
+    -- attack are the same animation group, and cancelling the draw before the
+    -- engine's 'equip attach' key leaves the weapon equipped with no mesh.
+    -- The per-frame attack cancel below skips whatever group is drawing.
+    drawTracker        = require('scripts.ossc.ossc_cast_rules').newDrawTracker(),
     spellStanceAllowed = false, -- persistent toggle: user pressed R, wants spell stance open
     prevStance         = nil,   -- stance on the previous frame (pre-toggle intent, see onFrame)
     prevSpellKeyDown   = false,
     prevWeaponKeyDown  = false,
     isGrimoireIdlePlaying = false, -- grimoire idle animation state (see below)
-    -- ── Previous-frame baseline for quickkey change detection ─────────────
-    -- The engine applies a quickkey's selection + Spell stance BEFORE any Lua
-    -- input handler runs (ActionManager::executeAction runs the native
-    -- quickKey() first; queued Lua input callbacks only see the result). A
-    -- snapshot taken inside handleQuickkeyPress therefore describes the
-    -- POST-press state and change detection against it can never fire. These
-    -- fields hold the selection / stance / equipment as of the END of the
-    -- previous onFrame — the true pre-press state. Refreshed at every onFrame
-    -- exit (see updatePrevFrameStore) and in onLoad.
+    -- ── Previous-frame baseline ──
+    -- The engine applies quickkeys BEFORE Lua input handlers, so this end-of-frame
+    -- snapshot is the true pre-press state. Refreshed by updatePrevFrameStore / onLoad.
     prevFrameSpell     = nil,
     prevFrameItem      = nil,
     prevFrameStance    = nil,
     prevFrameEquipment = nil,
-    -- ── Stance to put back once a quickkey cast finishes ──────────────────
-    -- Set when a quickkey press resolves into an actual cast, cleared by
-    -- animUnlock. Both revert paths in the quickkey handler are scoped to a
-    -- *pending* press and QuickkeyPress.slot is cleared the moment the press
-    -- resolves, so a cast that does fire would otherwise leave the engine's
-    -- Spell stance up for good. See restoreStanceAfterCast.
-    --
-    -- While the cast is in flight the target is also what the onUpdate mirror
-    -- reverts late raises to (Stance.quickkeyRevertTarget), and it is why a
-    -- spam press must NOT clear it (handleQuickkeyPress): the cast is still
-    -- running and animUnlock is the only place that puts the stance back.
+    -- ── Stance to restore after a quickkey cast ──
+    -- Cleared only by animUnlock; a spam press must NOT clear it.
     postCastRestore    = nil,
-    -- Native QuickKey processing happens before OSSC's queued input callback.
-    -- Keep a small, explicit suppression window after the pending press is
-    -- resolved so a delayed stance raise (or the engine's re-raise during an
-    -- OSSC cast) cannot escape the blockade.  This is deliberately separate
-    -- from `slot`: CastOnQuickkeys may be off, and a native raise may arrive
-    -- after the pending press has already been consumed.
+    -- Post-press suppression window for delayed native Spell raises;
+    -- separate from QuickkeyPress.slot, which may already be consumed.
     nativeQuickkeySuppression       = false,
     nativeQuickkeySuppressionUntil  = 0,
     nativeQuickkeyRestoreTarget     = nil,
     nativeQuickkeyWeapon            = nil,
     prevFrameWeapon                 = nil,
+    -- Stance a quickkey press started from, read by triggerQuickCast's
+    -- spell-stance gate (the live stance is already the engine's raise by then).
+    quickkeyCastStance              = nil,
 }
 Stance.lastNonSpellStance = types.Actor.getStance(self)
 if Stance.lastNonSpellStance == STANCE.Spell then
@@ -889,65 +836,36 @@ Stance.prevStance = types.Actor.getStance(self)
 -- WeaponLowerBody) so the swing keeps RightArm/Torso; otherwise the full
 -- upper-body mask is used so 2H grip idles cannot pin the casting arm.
 local function buildCastBlendOptions(finalSpeed, animGroup)
-    local priority = {
-        [BONE.LeftArm]   = PRIO.Hit,
-        [BONE.LowerBody] = PRIO.WeaponLowerBody,
-    }
-    local blendMask = BMASK.LeftArm + BMASK.LowerBody
     -- Relaxed stance (Nothing -- weapon sheathed, nothing readied): no grip
-    -- idle pins the casting arm, so the cast stays on the casting hand alone
-    -- and the weapon arm keeps its idle instead of going stiff for the whole
-    -- cast. A nil stance reads the same way -- nothing readied, nothing to
-    -- beat. (Direct engine read, no pcall: getStance is a plain getter.)
-    local stance = types.Actor.getStance(self)
+    -- idle pins the casting arm, so the cast stays on the casting hand alone.
     -- A suppressed quickkey cast is still standing in the engine's transient
     -- Spell raise when the cast starts (the revert lands right after
     -- triggerQuickCast): judge the pre-press stance the actor actually casts
     -- in, not the transient raise.
+    local stance = types.Actor.getStance(self)
     if Stance.nativeQuickkeySuppression and Stance.nativeQuickkeyRestoreTarget ~= nil then
         stance = Stance.nativeQuickkeyRestoreTarget
     end
     local preserveAttack = shouldPreserveLightAttackBones()
-    local relaxedStance = stance == nil or stance == STANCE.Nothing
-    -- 'eqcastr' is the Eternal Grimoire's RIGHT-hand cast (the book occupies
-    -- the left hand): it needs RightArm, so the relaxed-stance rule must not
-    -- strip it down to the casting hand. The mid-swing rule above still
-    -- applies to it unchanged.
-    if animGroup == 'eqcastr' then
-        relaxedStance = false
-    end
-    if preserveAttack or relaxedStance then
+    -- One rule for every OSSC caster (player, NPC, creature):
+    -- scripts/ossc/ossc_cast_rules.lua. Required inline: this chunk is at
+    -- Lua's 200-local limit.
+    local opts, leftArmOnly = require('scripts.ossc.ossc_cast_rules').buildCastBlendOptions{
+        speed = finalSpeed, animGroup = animGroup, stance = stance, preserveAttack = preserveAttack,
+    }
+    if leftArmOnly then
         debugLog("Cast blend: LeftArm-only cast (" .. tostring(animGroup)
             .. " stance=" .. tostring(stance)
             .. " midSwing=" .. tostring(preserveAttack) .. ")")
-    else
-        -- Full upper-body claim: beats Weapon-stance idles (idle1h /
-        -- idletwohand / ... at Default/Movement) so a two-hander's grip cannot
-        -- pin the casting arm, but stays below PRIORITY.Weapon so a real
-        -- weapon attack that starts mid-cast still wins the bones.
-        priority[BONE.RightArm] = PRIO.Hit
-        priority[BONE.Torso]    = PRIO.Hit
-        blendMask = blendMask + BMASK.RightArm + BMASK.Torso
     end
-    return {
-        priority  = priority,
-        startKey  = 'start',
-        stopKey   = 'stop',
-        blendMask = blendMask,
-        speed     = finalSpeed,
-    }
+    return opts
 end
 
 -- ── NEW — grimoire idle state ──────────────────────────────────────────────
 local OSSC_PowerCooldowns = {}
 
 local function isSpeedyMagickInstalled()
-    -- Decided by the load order. The previous version probed
-    -- storage.playerSection('SettingsyksuiSpeedyMagick') and friends, which
-    -- CREATES those sections on read, so it reported SpeedyMagick as installed
-    -- on every machine and always applied its speed scaling; it then pcall'd
-    -- `require` over six candidate module paths, which the content-file check
-    -- makes unnecessary.
+    -- Decided by load order. Do not probe storage sections: reading creates them.
     if I.SpeedyMagick or I.yksuiSpeedyMagick or I.yksui_speedy_magick then
         return true
     end
@@ -969,13 +887,8 @@ local function getSpeedyMagickSpeedMult()
     return 2.0 / (1.0 + 2.0 ^ -(spd / 100.0))
 end
 
--- ── Ralts Nifty Spell Pack (NSP) — Alacrity compatibility ────────────────
--- Alacrity (magic effect 'nsp_alacrity') scales the caster's spellcast speed
--- proportional to its magnitude, up to 4x at 100 magnitude. NSP drives this by
--- calling anim.setSpeed(self, 'spellcast', ...) on the vanilla group, which has
--- no effect on OSSC's own quickcast animation groups. To stay compatible, we
--- read the exact same active-effect magnitude NSP uses and apply the identical
--- multiplier to OSSC's cast animation speed.
+-- ── Ralts Nifty Spell Pack — Alacrity compatibility ──
+-- NSP only speeds the vanilla 'spellcast' group; apply the same multiplier here.
 local NSP_ALACRITY_EFFECT_ID = 'nsp_alacrity'
 local NSP_ALACRITY_MAX_SPEED = 4.0
 local hasNspAlacrity = (core.magic.effects.records[NSP_ALACRITY_EFFECT_ID] ~= nil)
@@ -996,24 +909,13 @@ local function getNSPAlacritySpeedMult()
     return 1.0
 end
 
--- ── Shield Casting Penalty ────────────────────────────────────────────────
--- Optional slowdown for quick-casting while a shield is equipped. Uses the
--- Carry-Capacity Ratio formula:
---   capacity = (Strength + Proficiency) / 2
---   penalty  = W * 45 / (capacity + 45)
---   mult     = 1 - (penalty / 100) * v
--- where W = shield weight capped at 45, Proficiency = the currently-cast spell
--- school's skill (Enchant skill for enchanted items), and v = the strength the
--- 'ShieldCastingPenalty' setting picks (Off / 10%..100% / Skill based — see
--- Penalty.shield in scripts/ossc/ossc_penalty.lua; 'skill_based' derives v
--- from Proficiency: 0 → 1.0, 100+ → 0). Result is clamped so a cast can never
--- be slowed below 0.55x.
+-- ── Shield Casting Penalty ──
+-- capacity = (Str + Proficiency)/2; penalty = W*45/(capacity+45); mult = 1 - penalty/100*v
+-- W = shield weight capped at 45; mult clamped to >= 0.55.
 local function getShieldCastingPenaltyMult(schoolStr, isItem)
     if not Cfg.general then return 1.0 end
     local mode = Cfg.general:get('ShieldCastingPenalty')
     local skillBased = Penalty.isSkillBased(mode)
-    -- A flat strength of 0 (off, or a value nothing recognises) needs no
-    -- shield lookup; the skill-based strength is only known after it.
     local v = skillBased and 1.0 or Penalty.shield.strength(mode)
     if v <= 0 then return 1.0 end
 
@@ -1062,10 +964,7 @@ local SCHOOL_STRS = {
     [3]="illusion",[4]="mysticism",[5]="restoration"
 }
 
---- Current (effective) value of the magic skill a cast is judged by:
---- the casted spell's school skill, or the Enchant skill for enchanted items.
---- Accepts the school as a name string or, on engine builds where the
---- effect record exposes it as an index, as the 0-5 school number.
+-- Effective skill for the cast's school (Enchant for items); school may be a name or 0-5 index.
 local function getMagicSkillValue(caster, school, isItem)
     if not (caster and caster.isValid and caster:isValid()) then return 0 end
     local skillId = isItem and 'enchant' or school
@@ -1106,31 +1005,80 @@ local function isQuickcastInterrupted()
     -- the canMove fallback for real knockdowns, but exclude encumbrance.
     if not types.Actor.canMove(self) and not isOverEncumbered(self) then return true end
     if isParalyzedOrSilenced(self) then return true end
-    for _, groupName in ipairs(INCAPACITATED_GROUPS) do
+    for _, groupName in ipairs(Anim.INCAPACITATED_GROUPS) do
         if anim.isPlaying(self, groupName) then return true end
     end
     return false
 end
 
+-- Match OpenMW's data-mw/scripts/omw/playerskillhandlers.lua without
+-- re-entering the external skillUsed handler chain (a caller may already be
+-- inside that chain when it calls awardSkillProgress).
+local function getSkillClass()
+    local npc = types.NPC.record(self)
+    return npc and npc.class and types.NPC.classes.record(npc.class)
+end
+
+local function classHasSkill(skills, skillId)
+    for _, id in pairs(skills or {}) do
+        if id == skillId then return true end
+    end
+    return false
+end
+
+local function skillProgressRequirement(skillId, base)
+    local cls = getSkillClass()
+    local rec = core.stats.Skill.record(skillId)
+    local factor = core.getGMST('fMiscSkillBonus') or 1.25
+    if cls then
+        if classHasSkill(cls.majorSkills, skillId) then
+            factor = core.getGMST('fMajorSkillBonus') or 0.75
+        elseif classHasSkill(cls.minorSkills, skillId) then
+            factor = core.getGMST('fMinorSkillBonus') or 1.0
+        end
+        if rec and rec.specialization == cls.specialization then
+            factor = factor * (core.getGMST('fSpecialSkillBonus') or 0.8)
+        end
+    end
+    return (base + 1) * factor
+end
+
 local function levelUpSkill(skillId, newBaseValue)
     local skill = types.NPC.stats.skills[skillId](self)
     skill.base = newBaseValue
-    local skillData = MAGIC_SKILLS[skillId]
+    -- Vanilla usage raises at most one level and discards overflow.
+    skill.progress = 0
+    local skillData = core.stats.Skill.record(skillId) or MAGIC_SKILLS[skillId]
     local displayName = skillData and skillData.name or skillId
-    local skillNameGMST = core.getGMST('sSkill' .. displayName) or displayName
-    local skillUpMsg = GMST.sSkillUp
-    ui.showMessage(string.format(skillUpMsg, skillNameGMST, newBaseValue))
+    ui.showMessage(string.format(GMST.sSkillUp, displayName, newBaseValue))
     core.sound.playSound3d("skillraise", self)
     local levelStats = types.Player.stats.level(self)
     if levelStats then
-        levelStats.progress = (levelStats.progress or 0) + 1
-        if skillData then
+        local cls = getSkillClass()
+        local levelGain = 0
+        -- This spelling is the engine's actual GMST id.
+        local attributeGain = core.getGMST('iLevelupMiscMultAttriubte') or 1
+        if cls and classHasSkill(cls.minorSkills, skillId) then
+            levelGain = core.getGMST('iLevelUpMinorMult') or 1
+            attributeGain = core.getGMST('iLevelUpMinorMultAttribute') or 1
+        elseif cls and classHasSkill(cls.majorSkills, skillId) then
+            levelGain = core.getGMST('iLevelUpMajorMult') or 1
+            attributeGain = core.getGMST('iLevelUpMajorMultAttribute') or 1
+        end
+        levelStats.progress = (levelStats.progress or 0) + levelGain
+        if skillData and skillData.attribute then
             local attr = skillData.attribute
             levelStats.skillIncreasesForAttribute[attr] =
-                (levelStats.skillIncreasesForAttribute[attr] or 0) + 1
+                (levelStats.skillIncreasesForAttribute[attr] or 0) + attributeGain
+        end
+        if skillData and skillData.specialization then
             local spec = skillData.specialization
             levelStats.skillIncreasesForSpecialization[spec] =
-                (levelStats.skillIncreasesForSpecialization[spec] or 0) + 1
+                (levelStats.skillIncreasesForSpecialization[spec] or 0)
+                + (core.getGMST('iLevelupSpecialization') or 1)
+        end
+        if levelStats.progress >= (core.getGMST('iLevelUpTotal') or 10) then
+            ui.showMessage(core.getGMST('sLevelUpMsg') or '#{sLevelUpMsg}')
         end
     end
 end
@@ -1146,12 +1094,13 @@ end
 -- is deliberately NOT gated by the setting.
 -- ============================================================
 
---- The gain OSSC's own formula would award, used when the caller does not say
---- how much: the SkillExperience setting as a percentage of one skill level -
---- exactly what the internal 'ossc' mode computes.
-local function defaultSkillGain()
-    local xpGain = Cfg.general and Cfg.general:get('SkillExperience') or 0
-    return (tonumber(xpGain) or 0) * 0.01
+--- Raw skill-use points, not a fraction of a level. A ratio of 1 uses the
+--- loaded skill record unchanged, including changes made by content mods.
+local function defaultSkillGain(skillId, useType)
+    local rec = core.stats.Skill.record(skillId)
+    local gain = rec and rec.skillGain and rec.skillGain[useType + 1]
+    local ratio = tonumber(Cfg.general and Cfg.general:get('SkillExperience')) or 1
+    return (gain or 0) * ratio
 end
 
 --- Award spellcasting skill experience to the player.
@@ -1161,13 +1110,17 @@ end
 --- Works whatever the Skill Progression Mode setting says, 'none' included.
 ---
 --- @param skillId string  skill record id: 'destruction', 'enchant', ... or a
----                        custom skill added by another framework
+---                        custom skill with an NPC stat and skill record
 --- @param options table?
----   skillGain number   progress to add, in the unit skill.progress is exposed
----                      in: 1.0 == one skill level.  Major / minor /
----                      specialization bonuses are NOT applied - the caller
----                      owns the formula.
----   useType   number   SkillProgression use type, forwarded on backend = 'external'
+---   skillGain number   raw vanilla skill-use points, as in SkillProgression.
+---                      Divided by (base + 1) and the class/specialization
+---                      factor. An explicit gain is not scaled by settings.
+---   useType   number   SkillProgression use type (0..3), selects the skill
+---                      record gain when skillGain is absent; also forwarded
+---                      on backend = 'external'. Defaults to Enchant_UseMagicItem ("Cast
+---                      When Used") for skillId 'enchant' - the only enchant
+---                      raise a quick-cast can trigger is a CastOnUse item -
+---                      and to Spellcast_Success for every other skill.
 ---   backend   string   'stat' (default): apply it to the player's skill here.
 ---                      'external': hand the use to I.SkillProgression.skillUsed
 ---                      (NCG / Skill Evolution / MBSP / SUS), which then owns
@@ -1188,33 +1141,45 @@ local function awardSkillProgress(skillId, options)
     end
     if (stat.base or 0) >= 100 then return false, 'skill is already at 100' end
 
+    local useType = options.useType
+    if useType == nil then useType = skillId == 'enchant' and 1 or 0 end
+    if type(useType) ~= 'number' or useType ~= math.floor(useType)
+        or useType < 0 or useType > 3 then
+        return false, 'useType must be an integer from 0 to 3'
+    end
+    local gain = tonumber(options.skillGain)
+    if options.skillGain ~= nil and (not gain or gain ~= gain or math.abs(gain) == math.huge) then
+        return false, 'skillGain must be a finite number'
+    end
+
     if options.backend == 'external' then
         if not (I.SkillProgression and I.SkillProgression.skillUsed) then
             return false, 'no external skill-progression interface is installed'
         end
         I.SkillProgression.skillUsed(skillId, {
-            useType   = options.useType
-                or I.SkillProgression.SKILL_USE_TYPES.Spellcast_Success,
-            skillGain = tonumber(options.skillGain),
+            useType   = useType,
+            skillGain = gain,
         })
         debugLog("[OSSC] handed " .. skillId .. " to I.SkillProgression.skillUsed")
         return true
     end
 
-    local gain = tonumber(options.skillGain) or defaultSkillGain()
-    if gain <= 0 then return false, 'nothing to award' end
-
-    -- skill.progress is 0..1 of the requirement, so crossing 1.0 is a level.
-    local progress = stat.progress + gain
-    local base = stat.base
-    while progress >= 1.0 and base < 100 do
-        base = base + 1
-        progress = progress - 1.0
-        levelUpSkill(skillId, base)
+    if types.NPC.isWerewolf and types.NPC.isWerewolf(self) then
+        return false, 'werewolves do not gain skill experience'
     end
-    stat.progress = math.max(0, progress)
-    debugLog(string.format("[OSSC] awarded %.2f progress to %s (base now %d)",
-        gain, skillId, base))
+    gain = gain or defaultSkillGain(skillId, useType)
+    if gain ~= gain or gain == math.huge or gain <= 0 then return false, 'nothing to award' end
+    local requirement = skillProgressRequirement(skillId, stat.base)
+    if requirement <= 0 then return false, 'skill progress requirement must be positive' end
+
+    local progress = stat.progress + gain / requirement
+    if progress >= 1 then
+        levelUpSkill(skillId, stat.base + 1)
+    else
+        stat.progress = progress
+    end
+    debugLog(string.format("[OSSC] awarded %.4f skill-use points (%.4f progress) to %s",
+        gain, gain / requirement, skillId))
     return true
 end
 
@@ -1230,17 +1195,48 @@ local getPenaltyScale = Penalty.scale
 -- one would be lost for a weakened effect.  Scrolls are recognised the same
 -- way upcalls see them — as CastOnce enchantments.  Regular spells and
 -- equipped magic items (CastOnUse / ConstantEffect) are always penalised.
+--
+-- Sure casts (powers, abilities, "Always Succeeds" spells) are exempt from
+-- the Quick Cast Chance Penalty (getCastChance answers 100 before any
+-- scaling — vanilla never rolls a sure cast). The Quick Cast Effect Penalty
+-- keeps its own, separate rule: Powers — and Powers alone — never pay it
+-- (effectPenaltyExempt below). UseFatigue and the Shield Casting Penalty
+-- apply to every cast.
+local function isSureCastSpell(spell)
+    if not spell then return false end
+    -- An enchanted-item cast must never be read as a spell record: an
+    -- enchantment record's `type` is an EnchantmentType whose numbers overlap
+    -- SPELL_TYPE's (CastOnUse == Ability == 1). Every cast through
+    -- ossc_actor_items.lua is flagged `item` / `enchantment`.
+    if spell.item or spell.enchantment then return false end
+    if casterUtils.isSureCastRecord(spell) then return true end
+    local rec = spell.id and spellRecs[spell.id] or nil
+    return casterUtils.isSureCastRecord(rec)
+end
+
+--- Whether the Quick Cast Effect Penalty skips this cast. Two rules: Powers
+--- never pay it (unconditional — a Power burning its once-a-day use must
+--- land at full strength; abilities and "Always Succeeds" spells are NOT
+--- covered, their only exemption is the chance penalty — see
+--- isSureCastSpell), and the QuickCastEffectPenaltyScrollsExempt toggle
+--- excludes scrolls — and scrolls alone — when it is on. Scrolls are
+--- recognised the same way upcalls see them — as CastOnce enchantments.
+--- Enchanted items are always penalised: every cast through
+--- ossc_actor_items.lua is flagged `item`. An enchanted-item cast's records
+--- are never read as SPELL records (an enchantment record's `type` is an
+--- EnchantmentType whose numbers overlap SPELL_TYPE's).
 local function effectPenaltyExempt(spell)
     if not spell then return false end
-    -- Powers never pay the Quick Cast Effect Penalty (unconditional).
-    if spell.type == SPELL_TYPE.Power then return true end
-    local rec = (spell.id and spellRecs[spell.id]) or nil
-    if not rec and spell.enchantment then rec = spell.enchantment end
-    if not rec and spell.id then rec = enchRecs[spell.id] end
-    if rec and rec.type == SPELL_TYPE.Power then return true end
 
-    -- The exclusion toggle covers scrolls ONLY.  While it is off, only powers
-    -- are exempt.
+    -- Powers never pay the Quick Cast Effect Penalty (unconditional).
+    if not spell.item and not spell.enchantment then
+        if spell.type == SPELL_TYPE.Power then return true end
+        local rec = spell.id and spellRecs[spell.id] or nil
+        if rec and rec.type == SPELL_TYPE.Power then return true end
+    end
+
+    -- The exclusion toggle covers scrolls ONLY.  While it is off, nothing
+    -- else is exempt.
     if not (Cfg.general and Cfg.general:get('QuickCastEffectPenaltyScrollsExempt')) then
         return false
     end
@@ -1250,6 +1246,42 @@ local function effectPenaltyExempt(spell)
     -- still penalised.
     local ench = spell.enchantment or (spell.id and enchRecs[spell.id])
     return ench ~= nil and ench.type == ENCHTYPE.CastOnce
+end
+
+--- Vanilla skill-progression gate, mirroring the engine's own
+--- `spellIncreasesSkill` (mwmechanics/spellutil.cpp): a cast raises
+--- Spellcast_Success only when it is a plain ST_Spell record without the
+--- "Always Succeeds" flag.  Abilities, Powers, diseases/curses and
+--- always-succeed spells raise no skill in vanilla, so OSSC must neither
+--- award nor announce one for them - OSSC_SkillProgressSkipped tells a
+--- consumer to grant progress vanilla never would have granted.  The same
+--- sure casts that skip the cast-chance roll skip skill progress.  A cast
+--- whose record carries no type at all (a custom spell table) is treated as
+--- a regular spell: the default-award side of an unknown.
+local function spellIncreasesSkill(spell)
+    if not spell then return false end
+    -- An enchanted-item cast is never a SPELL record (see isSureCastSpell):
+    -- its `type` is an EnchantmentType whose numbers overlap SPELL_TYPE's.
+    if spell.item or spell.enchantment then return false end
+    local rec = (spell.id and spellRecs[spell.id]) or spell
+    if rec.item or rec.enchantment then return false end
+    if rec.alwaysSucceedFlag == true then return false end
+    if rec.type == nil then return true end
+    return rec.type == SPELL_TYPE.Spell
+end
+
+--- Vanilla Enchant progression gate (engine `CastSpell::cast(item)`): using
+--- an enchanted item raises Enchant only for CastOnUse - "Cast When Used" -
+--- enchantments.  Scrolls (CastOnce) just destroy themselves and
+--- ConstantEffect items are passive; CastOnStrike raises its own use type
+--- and never passes a quick-cast.  Since a CastOnUse quick-cast is the ONLY
+--- way an OSSC cast can raise Enchant, `skillId == 'enchant'` unambiguously
+--- means "Cast When Used" from there on - no separate isEnchant signal is
+--- needed anywhere in the skill-gain path.
+local function itemIncreasesEnchantSkill(spell)
+    if not spell then return false end
+    local ench = spell.enchantment or (spell.id and enchRecs[spell.id])
+    return ench ~= nil and ench.type == ENCHTYPE.CastOnUse
 end
 
 local function getDominantSkillSchool(spell)
@@ -1275,18 +1307,9 @@ local function getDominantSkillSchool(spell)
     return bestSchool
 end
 
--- ── Enchanted item cost / charge ──────────────────────────────────────────
--- An enchanted-item quick-cast is paid from the ITEM's charge, never from
--- magicka, and vanilla never rolls a skill check for it: the only thing that
--- can stop an item cast is a charge pool that cannot cover the cost.
---
--- [ENCHANT FORMULA] charge cost = 0.01 * (110 - Enchant skill) * spell cost.
--- The same formula lives in ossc_actor_items.lua (getEffectiveCost) and in
--- ossc_global.lua's OSSC_ConsumeCharge handler, and Spell Framework Plus
--- applies it too — Helpers.getModifiedSpellCost(actor, spellId, true). SFP
--- re-checks the charge against exactly that number in its launch-time
--- resource guard, so prefer SFP's own value when the interface is
--- registered: the gate here and the deduction at launch can never disagree.
+-- ── Enchanted item cost / charge ──
+-- Paid from item charge, no skill roll. Cost = 0.01*(110 - Enchant)*spell cost;
+-- prefer SFP's value so the gate and launch deduction cannot disagree.
 local function getEnchantmentCost(spell)
     if I.MagExp_Player and I.MagExp_Player.Helpers
         and I.MagExp_Player.Helpers.getModifiedSpellCost then
@@ -1299,10 +1322,7 @@ local function getEnchantmentCost(spell)
     return math.max(1, math.floor(0.01 * (110 - skill) * (spell.cost or 1)))
 end
 
--- Charge currently held by the item backing an enchanted-item cast.
--- types.Item.itemData() is the only reader the engine offers (and it can come
--- back nil on an item the engine has never had to describe), so fall back to
--- the enchantment record's capacity — a never-used item is full.
+-- itemData() can be nil on a never-described item: fall back to full capacity.
 local function getItemCharge(spell)
     local ench = spell.enchantment or (spell.id and enchRecs[spell.id])
     local charge = (ench and ench.charge) or 0
@@ -1316,10 +1336,7 @@ local function getItemCharge(spell)
     return charge
 end
 
--- Can this enchanted item pay for one more cast?
---   * CastOnce (scrolls) are consumed whole — one has to be left to use.
---   * Constant Effect enchantments are passive and never spend charge.
---   * everything else spends charge and needs enough of it.
+-- CastOnce consumed whole; Constant Effect never spends charge; others need charge.
 local function canAffordItemCast(spell)
     local ench = spell.enchantment or (spell.id and enchRecs[spell.id])
     local enchType = ench and ench.type
@@ -1334,17 +1351,20 @@ local function canAffordItemCast(spell)
 end
 
 local function getCastChance(spell, caster)
-    -- ── Powers are sure casts ─────────────────────────────────────────────
+    -- ── Sure casts are sure ───────────────────────────────────────────────
     -- Vanilla never rolls to see whether a Power goes off; it spends the
-    -- once-a-day use and the spell lands.  Spell Framework Plus agrees and
+    -- once-a-day use and the spell lands.  Abilities and "Always Succeeds"
+    -- spells are the same kind of sure cast.  Spell Framework Plus agrees and
     -- reports a 100% chance for a power (magexp_helpers.getSpellCastChance),
-    -- but the quick-cast penalty below multiplied that 100 by its own scale —
-    -- and the skill scale at skill 0 is 0.5, so a power cast through the
-    -- quick-cast system resolved at exactly 50% and the release-moment roll
-    -- dropped every other one.  A power is answered here, before any penalty
-    -- arithmetic can touch it: always 100, whatever the settings or the skill.
-    local powerRec = (spell.id and spellRecs[spell.id]) or spell.enchantment or nil
-    if spell.type == SPELL_TYPE.Power or (powerRec and powerRec.type == SPELL_TYPE.Power) then
+    -- but the quick-cast chance penalty below multiplied that 100 by its own
+    -- scale — and the skill scale at skill 0 is 0.5, so a power cast through
+    -- the quick-cast system resolved at exactly 50% and the release-moment
+    -- roll dropped every other one.  A sure cast is answered here, before the
+    -- chance penalty can touch it: always 100, whatever the settings or the
+    -- skill.  (That chance exemption is what this rule grants; the effect
+    -- penalty keeps its own Powers-only exclusion, and fatigue and the
+    -- shield slowdown apply to every cast.)
+    if isSureCastSpell(spell) then
         return 100, getDominantSkillSchool(spell)
     end
     if spell.item then
@@ -1366,8 +1386,11 @@ local function getCastChance(spell, caster)
         ignoreFatigue = not (Cfg.general and Cfg.general:get('UseFatigue')),
         costAlreadyPaid = true,
     })
+    local baseChance = chance
     -- 'skill_based': the penalty follows the cast skill (0 → 50%, 100+ → none);
-    -- anything else is a flat percentage (or off).
+    -- anything else is a flat percentage (or off). The framework helper above
+    -- supplies the vanilla base roll (cost, lowest effect school, Sound,
+    -- modified attributes, and live fatigue); OSSC only scales that result.
     local chanceMode = Cfg.general and Cfg.general:get('QuickCastChancePenalty')
     local chanceScale
     if Penalty.isSkillBased(chanceMode) then
@@ -1376,6 +1399,8 @@ local function getCastChance(spell, caster)
         chanceScale = getPenaltyScale(chanceMode)
     end
     chance = math.max(0, math.min(100, util.round(chance*chanceScale)))
+    debugLog(string.format('Cast chance: vanilla=%s%% OSSC scale=%.3f final=%s%%',
+        tostring(baseChance), chanceScale, tostring(chance)))
     return chance, school
 end
 
@@ -1423,16 +1448,8 @@ local function calcSpellCost(spell)
     return cost
 end
 
--- ── MBSP Magicka Refund (cloned 1:1 from MBSP/Scripts/MBSP/MBSP_p.lua) ──────
--- The MagickaRefund setting enables MBSP standalone's "Refund" mode behaviour
--- for OSSC quick-casts: after a successful magic-school spell cast, a portion
--- of the spell's magicka cost is returned based on your average magic skill.
--- mbspCheckSpell / mbspGetAverageSkill / mbspCalcRefund mirror MBSP's
--- checkSpell / getAverageSkill / calcRefund exactly (GameSpell cost method
--- with fEffectCostMult, per-school cost shares, exponential effective-cost
--- formula). The refund applies only to spells (not powers or enchanted
--- items), only when positive, and is skipped in god mode — matching MBSP's
--- registerSkillUsed "Refund" handler.
+-- ── MBSP Magicka Refund (cloned 1:1 from MBSP_p.lua) ──
+-- Spells only, positive only, never in god mode.
 local mbspSpellDB = {}
 local function mbspCheckSpell(spell)
     local spellId = spell.id
@@ -1486,8 +1503,7 @@ local function mbspCheckSpell(spell)
 end
 
 local function mbspGetAverageSkill(spell, s)
-    -- MBSP: willpower/5 + luck/10, plus each magic school skill weighted by
-    -- its share of the spell's calculated cost.
+    -- MBSP: willpower/5 + luck/10 + school skills weighted by cost share.
     local skill = types.NPC.stats.attributes['willpower'](self).modified / 5
                 + types.NPC.stats.attributes['luck'](self).modified / 10
     for school, cost in pairs(s.schools) do
@@ -1510,9 +1526,7 @@ local function mbspCalcRefund(spell, refundStart, refundMult, levelScaling)
     return refund
 end
 
--- Reads the OSSC MagickaRefund settings. Defaults match MBSP standalone:
--- Skill Requirement 35, Magicka Cost Scaling 50% (stored as percent,
--- divided by 100 like MBSP's percentKeys), Level Scaling 100.
+-- Defaults match MBSP: skill req 35, cost scaling 50 (percent), level scaling 100.
 local function getMagickaRefundSettings()
     return {
         enabled      = Cfg.general and Cfg.general:get('MagickaRefund') == true,
@@ -1522,8 +1536,7 @@ local function getMagickaRefundSettings()
     }
 end
 
--- MBSP "Refund" mode application: refund only when positive, never in god
--- mode (matches MBSP's registerSkillUsed). No upper clamp — MBSP has none.
+-- Refund only when positive, never in god mode; no upper clamp (matches MBSP).
 local function applyMagickaRefund(spell)
     local st = getMagickaRefundSettings()
     if not st.enabled then return end
@@ -1541,34 +1554,25 @@ local function enableCombatBlock()
 end
 
 local function disableCombatBlock()
-    if not combatBlockActive then return end
+    if not Cast.combatBlockActive then return end
     setCombatBlock(false)
 end
 
--- Reads the caster's magicka pool. Payment itself happens in handleCastCosts,
--- at animation start: through Spell Framework Plus' consumeSpellCost when the
--- interface is registered, and from OSSC's own pocket otherwise.
+-- Payment happens in handleCastCosts (SFP consumeSpellCost when registered).
 local function hasMagicka(cost)
     local magicka = types.Actor.stats.dynamic.magicka(self)
     return magicka.current >= (cost or 0)
 end
 
--- Pays (or refuses) everything a quick-cast costs. Returns
---   paid     — true when the cast may go through
---   failMsg  — the toast to show when it may not; nil when the casting
---              framework already showed its own message
+-- Returns paid, failMsg (nil when the framework already showed one).
 local function handleCastCosts(spell)
     if debug.isGodMode() then return true end
 
     -- ── Enchanted item: the item's charge pays, magicka is untouched ──────
     if spell.item then
         if canAffordItemCast(spell) then
-            -- The charge itself is spent by Spell Framework Plus at launch:
-            -- OSSC sends isFree = false for item casts, which makes SFP's
-            -- resource guard deduct the cost from the item. enchantmentCharge
-            -- can only be written from a global script, so this script must
-            -- not try to deduct it here (it would either error or be
-            -- silently dropped, and MagExp would deduct a second time).
+            -- SFP deducts item charge at launch (isFree = false). enchantmentCharge is
+            -- global-script-only: never deduct here or it is charged twice.
             return true
         end
         local ench = spell.enchantment or (spell.id and enchRecs[spell.id])
@@ -1591,28 +1595,18 @@ local function handleCastCosts(spell)
 
     local canAfford, failMsg = true, nil
     if I.MagExp_Player and I.MagExp_Player.consumeSpellCost then
-        -- SFP checks the pool AND deducts the cost, and shows its own
-        -- insufficient-magicka toast — so no second toast from OSSC.
+        -- SFP checks, deducts, and toasts itself.
         canAfford = I.MagExp_Player.consumeSpellCost(spell.id, nil)
         debugLog(string.format("Magicka cost %s (consumeSpellCost → %s)",
             tostring(magickaCost), tostring(canAfford)))
     else
-        -- No consumer registered: OSSC pays the magicka itself, right here at
-        -- animation start. Vanilla drains the pool the moment the cast
-        -- gesture begins — not when the spell is released at the animation's
-        -- end — so deferring the deduction to SFP's launch-time resource
-        -- guard is not an option. The launch therefore goes out with
-        -- isFree = true (see the CastRequest) so the same cast can never be
-        -- charged a second time at the release point.
+        -- No SFP consumer: pay at animation start (vanilla timing);
+        -- launch then goes out isFree = true to avoid a second charge.
         canAfford = hasMagicka(magickaCost)
         if canAfford then
             if magickaCost > 0 then
                 local magicka = types.Actor.stats.dynamic.magicka(self)
-                -- [MAGICKA TRACE] One of three deduction sites (the other two
-                -- are in magexp_player.lua: consumeSpellCost and
-                -- MagExp_ConsumeResource). This one only runs when SFP has not
-                -- registered its consumer, so a player with SFP installed must
-                -- never see this line and one of those in the same cast.
+                -- [MAGICKA TRACE] Deduction site 3 of 3; never fires in the same cast as SFP's.
                 local before = magicka.current
                 magicka.current = math.max(0, magicka.current - magickaCost)
                 debugLog(string.format(
@@ -1632,14 +1626,8 @@ local function handleCastCosts(spell)
     if canAfford and Cfg.general and Cfg.general:get('UseFatigue') then
         local fatigue = types.Actor.stats.dynamic.fatigue(self)
         if fatigue then
-            -- MCP (Morrowind Code Patch) formula:
-            --   fatigue loss = magickaCost * (fFatigueSpellBase + enc% * fFatigueSpellMult)
-            -- Vanilla ships both GMSTs as 0 (no fatigue cost at all), which
-            -- made UseFatigue a silent no-op. When they are untuned, fall
-            -- back to a built-in default — half the magicka cost at zero
-            -- encumbrance up to the full magicka cost at full encumbrance —
-            -- so the setting works out of the box. Tuning either GMST
-            -- switches to the GMST-driven value.
+            -- MCP: fatigue = magickaCost * (fFatigueSpellBase + enc% * fFatigueSpellMult)
+            -- Both 0 (vanilla): default to 0.5x..1x magickaCost by encumbrance.
             local fBase = GMST.fFatigueSpellBase
             local fMult = GMST.fFatigueSpellMult
             if not (fBase > 0 or fMult > 0) then
@@ -1677,7 +1665,7 @@ local function add_cast_static_vfx(bone, vfx_id)
         if mgef then
             local castStaticId = mgef.castStatic
             local static = castStaticId and staticRecs[castStaticId]
-            if static and static.model and not spawnedModels[static.model] then
+            if static and static.model and static.model ~= "" and not spawnedModels[static.model] then
                 spawnedModels[static.model] = true
                 local opts = { loop=isContinuous, vfxId=vfx_id .. "_" .. tostring(i) }
                 if bone and bone ~= "" then opts.boneName = bone end
@@ -1694,7 +1682,14 @@ local function add_particle_swirl_vfx(bone, vfx_id)
     local isContinuous = spell.continuousVfx or false
     for i, eff in ipairs(spell.effects) do
         local mgef = effectRecs[eff.id]
-        if mgef then
+        -- An effect whose cast static is a real record with no model has
+        -- declared "no cast mesh" (drawn another way, e.g. by BeamFX):
+        -- the hand swirl substitutes for a *missing* cast visual, and
+        -- this one is missing on purpose, so do not substitute.
+        local castStatic = mgef and mgef.castStatic and staticRecs[mgef.castStatic]
+        local castSuppressed = castStatic ~= nil
+            and (castStatic.model == nil or castStatic.model == "")
+        if mgef and not castSuppressed then
             local texture = "vfx_starglow.tga"
             if mgef.particle and mgef.particle ~= "" and not mgef.particle:find("blank") then
                 texture = mgef.particle
@@ -1718,7 +1713,7 @@ local function add_hand_glow_vfx()
     if not castGlowOn then return end
     local castStaticId = mgef.castStatic
     local static = castStaticId and staticRecs[castStaticId]
-    if static and static.model then
+    if static and static.model and static.model ~= "" then
         local isContinuous = spell.continuousVfx or false
         anim.addVfx(self, static.model,
             { loop=isContinuous, vfxId="OSSC_HandGlow", boneName="Bip01 L Hand" })
@@ -1747,13 +1742,7 @@ local function launchCleanup(reason)
     stop_all_vfx()
     Cast.currentSpell    = nil
     Cast.hasQueuedLaunch = false
-    -- Drop only THIS cast's queued launches. A previous cast's entry is a
-    -- paid, RELEASED launch that has not fired yet: the cast unlocks on its
-    -- 'stop' text key while the launch still waits for the next onUpdate to
-    -- execute. Wiping the whole queue here (and at the next cast's start)
-    -- swallowed that spell while its magicka stayed consumed — the reported
-    -- "spamming the quickcast key sometimes costs double the magicka": one
-    -- gesture pays, the next one fires, the first spell silently vanishes.
+    -- Drop only THIS cast's launches; an earlier paid, released launch may still be queued.
     for i = #Cast.pendingLaunches, 1, -1 do
         if Cast.pendingLaunches[i].castId == Cast.currentCastId then
             table.remove(Cast.pendingLaunches, i)
@@ -1761,35 +1750,18 @@ local function launchCleanup(reason)
     end
 end
 
--- ── The quickkey window (helpers on the Stance table) ─────────────────────
--- A quickkey press and the cast it starts are ONE interaction: the engine
--- re-applies the key (and re-raises Spell stance with it) while the cast it
--- already started is still running, and on a spam burst each press does it
--- again. Both helpers below describe that single window. They live on the
--- Stance table rather than as file-scope locals because the handlers that need
--- them (onUpdate, the animation veto) are at LuaJIT's upvalue limit and
--- `Stance` is already one of their upvalues.
---
--- True while a quickkey press is pending OR a cast that a quickkey started is
--- still in flight. The `Cast.isCasting` test on the second half also ignores a
--- stale postCastRestore left behind by a cast that never reached animUnlock
--- (e.g. across a save load): that target may only matter while its cast runs.
+-- ── The quickkey window (helpers on Stance, for the upvalue limit) ──
+-- A press and the cast it starts are one window; the engine re-raises Spell during it.
+-- Cast.isCasting check ignores a stale postCastRestore (e.g. after load).
 function Stance.quickkeyWindowActive()
     return QuickkeyPress.slot ~= nil
         or (Cast.isCasting and Stance.postCastRestore ~= nil)
         or Stance.nativeQuickkeySuppression
 end
 
--- Suppress the hardcoded equip/unequip sounds the engine plays when the
--- stance flips Weapon<->Spell. CharacterController::updateWeaponState plays
---   downSoundId at unequip (Weapon->Spell) and upSoundId at equip
---   (Spell->Weapon) whenever !isStillWeapon, and isStillWeapon excludes
---   Spell/H2H via isWeaponOrToolType. When SuppressSpellStance is on the
---   weapon must stay visible with no sheath/draw sounds, so every place
---   that cancels the visual transition also stops these sounds.
+-- Stop engine equip/unequip sounds on Weapon<->Spell flips when SuppressSpellStance is on.
 function Stance.suppressWeaponTransitionSounds()
-    -- Keep the list local so only this function closes over it — onUpdate /
-    -- triggerQuickCast are at LuaJIT's 60-upvalue limit.
+    -- Local list: onUpdate/triggerQuickCast are at the 60-upvalue limit.
     local sounds = {
         "item weapon blunt up",
         "item weapon blunt down",
@@ -1838,20 +1810,26 @@ function Stance.suppressWeaponTransitionSounds()
         "Item Ammo Down",
     }
     for _, sid in ipairs(sounds) do
-        pcall(core.sound.stopSound3d, sid, self)
+        -- No pcall: stopping a sound that is not playing is a documented no-op
+        -- in the engine, so wrapping this only served to hide a broken binding.
+        core.sound.stopSound3d(sid, self)
     end
 end
 
--- A native quick-key is applied before OSSC's input callback.  Once the
--- callback has established that the press really selected a spell/item, this
--- bounded window owns every automatic Spell-stance re-raise until the native
--- transition and (when enabled) the OSSC cast have finished.  Keeping this
--- state outside QuickkeyPress is important: QuickkeyPress is intentionally
--- cleared before a cast animation begins, while the engine can still re-raise
--- Spell stance during that animation.
+-- Bounded window owning Spell re-raises until the native transition and cast finish.
+-- Kept out of QuickkeyPress, which is cleared before the cast animation begins.
 local QUICKKEY_STANCE_SUPPRESSION_GRACE = 0.75
 
+--- The window exists to put a quickkey-raised stance back DOWN so the cast can
+--- start from a clean non-Spell posture. With Allow Quick-Cast In Spell Stance
+--- on there is nothing to put down — the stance is where the cast starts — so
+--- no window is armed and the raise survives to the cast.
+local function allowCastInSpellStance()
+    return Cfg.general and Cfg.general:get('AllowQuickCastInSpellStance') == true
+end
+
 local function activateQuickkeyStanceSuppression()
+    if allowCastInSpellStance() then return end
     if not (Cfg.general and Cfg.general:get('SuppressSpellStance') == true) then return end
     Stance.nativeQuickkeySuppression      = true
     Stance.nativeQuickkeySuppressionUntil = core.getSimulationTime() + QUICKKEY_STANCE_SUPPRESSION_GRACE
@@ -1861,17 +1839,17 @@ local function activateQuickkeyStanceSuppression()
     if Stance.nativeQuickkeyRestoreTarget == STANCE.Spell then
         Stance.nativeQuickkeyRestoreTarget = STANCE.Nothing
     end
-    -- The previous-frame object is the authoritative weapon.  Do not use the
-    -- post-press equipment table: the native Magic/MagicItem quick-key may
-    -- already have changed the draw state by the time OSSC sees the callback.
+    -- Use the previous-frame weapon: post-press equipment may already be changed.
     Stance.nativeQuickkeyWeapon = Stance.prevFrameWeapon
-    -- The engine already started the sheathe and played the down sound in the
-    -- input phase before Lua runs. Stop it immediately.
+    -- Engine already started the sheathe and down sound before Lua runs.
     Stance.suppressWeaponTransitionSounds()
 end
 
 local function clearQuickkeyStanceSuppression()
     Stance.nativeQuickkeySuppression      = false
+    -- A captured press stance never survives a load or a cleared window: it
+    -- must describe the press that is being judged right now, nothing older.
+    Stance.quickkeyCastStance             = nil
     Stance.nativeQuickkeySuppressionUntil = 0
     Stance.nativeQuickkeyRestoreTarget    = nil
     Stance.nativeQuickkeyWeapon           = nil
@@ -1879,10 +1857,23 @@ local function clearQuickkeyStanceSuppression()
     Stance.collapsedDrawGroup             = nil
 end
 
--- A quick-key raises Spell stance in the input phase, BEFORE this script's
--- input callback, and the mechanics update then starts the weapon sheathe.
--- The groups that were already playing at the end of the previous frame are
--- real attacks; anything that appears only after the press is that sheathe.
+--- Hand the engine's Spell stance to a quick-cast that is starting from it.
+--- Only reachable with Allow Quick-Cast In Spell Stance on: the stance is the
+--- engine's own posture, and the stance-suppression machinery would otherwise
+--- put it back down under the cast the player just asked for (the quickkey
+--- window reverts a raise, the update mirror repeats the revert, and the cast
+--- ends up owning the arms while the stance underneath it is being swapped).
+--- Releasing here means: this stance is the cast's, not the suppression
+--- window's. `Stance.spellStanceAllowed` is deliberately NOT set — that flag
+--- means "the user opened the stance by hand", and the next weapon key or
+--- stance change still ends the window normally.
+function Stance.releaseSpellStanceForCast()
+    Stance.nativeQuickkeySuppression = false
+    Stance.nativeQuickkeySuppressionUntil = 0
+    Stance.transitionCancelDone = false
+end
+
+-- Groups playing before the press are real attacks; new ones are the quickkey sheathe.
 function Stance.noteCombatAnimsAtPress()
     local copy = {}
     if Stance.prevCombatAnims then
@@ -1893,28 +1884,28 @@ function Stance.noteCombatAnimsAtPress()
     Cast.combatAnimsAtPress = copy
 end
 
--- Set for the one triggerQuickCast a quick-key resolve is about to make, so a
--- sheathe the engine started for that press is not treated as a player attack.
--- Consumed at the top of triggerQuickCast, including when the cast is refused
--- for some other reason, so it cannot leak into the dedicated cast button.
+-- One-shot; consumed at triggerQuickCast's top even on refusal.
 function Stance.beginQuickkeyCastAttempt()
     Cast.exemptWeaponTransitionBlock = true
+    -- The native quickkey has already run, so a live read now may see the
+    -- engine's own transient Spell raise. The end-of-previous-frame baseline is
+    -- the stance the player actually pressed the key in.
+    Stance.quickkeyCastStance = Stance.prevFrameStance
 end
 
--- The engine re-attaches the weapon only from a draw play ('equip attach', or
--- its own showWeapons(true) when the set has no such key). Skipping the play
--- hides the mesh; letting it run from 'equip start' is the visible re-equip.
--- Start on the attach key so Animation::play fires it immediately (it emits
--- every text key at the start time), and finish the tail before the frame
--- renders. A missing or not-before-stop key is left alone: the engine's
--- fallback then shows the weapon, and the speed still collapses the motion.
+-- Weapon re-attaches only from a draw play: start at 'equip attach' and finish
+-- the tail before render. Missing/late key: leave it to the engine fallback.
 function Stance.collapseEquipPlay(groupname, options)
     local attachTime, stopTime
     if anim.getTextKeyTime then
-        local okA, attach = pcall(anim.getTextKeyTime, self, groupname .. ': equip attach')
-        local okS, stop = pcall(anim.getTextKeyTime, self, groupname .. ': equip stop')
-        if okA and type(attach) == 'number' then attachTime = attach end
-        if okS and type(stop) == 'number' then stopTime = stop end
+        -- No pcall: `getTextKeyTime` reports a missing key as nil (an absent
+        -- optional), so a raise here means the object has no animation system
+        -- at all — an engine error worth seeing, not a "draw play without keys"
+        -- case to swallow.
+        local attach = anim.getTextKeyTime(self, groupname .. ': equip attach')
+        local stop   = anim.getTextKeyTime(self, groupname .. ': equip stop')
+        if type(attach) == 'number' then attachTime = attach end
+        if type(stop) == 'number' then stopTime = stop end
     end
     if type(attachTime) == 'number' and attachTime >= 0
         and type(stopTime) == 'number' and attachTime < stopTime then
@@ -1928,11 +1919,7 @@ function Stance.collapseEquipPlay(groupname, options)
     Stance.suppressWeaponTransitionSounds()
 end
 
--- The press-frame sheathe has already started by the time Lua runs. Cancel it
--- once, before its 'unequip detach' key, so the mesh never leaves the hand.
--- Groups that were already playing are the player's attack and are left alone;
--- the cancel does not repeat, so an attack started during the cast is not
--- eaten by this (the heavy-attack rule still owns those).
+-- Cancel the press-frame sheathe once, before 'unequip detach'; pre-existing groups untouched.
 function Stance.cancelFreshWeaponTransition()
     if not Stance.nativeQuickkeySuppression or Stance.spellStanceAllowed then return end
     if Stance.transitionCancelDone then return end
@@ -1946,16 +1933,14 @@ function Stance.cancelFreshWeaponTransition()
         anim.cancel(self, group)
         debugLog("[OSSC Stance] Cancelled quickkey weapon transition: " .. group)
     end
-    for _, g in ipairs(LIGHT_ATTACK_GROUPS) do stray(g) end
-    for _, g in ipairs(HEAVY_ATTACK_GROUPS) do stray(g) end
+    for _, g in ipairs(Anim.LIGHT_ATTACK_GROUPS) do stray(g) end
+    for _, g in ipairs(Anim.HEAVY_ATTACK_GROUPS) do stray(g) end
     stray('shield')
     -- Also silence any down/up sound that the cancelled play already started.
     Stance.suppressWeaponTransitionSounds()
 end
 
--- Restore only an empty right-hand slot.  A player (or another mod) may have
--- deliberately equipped a different weapon during the cast; never overwrite
--- that newer choice with the weapon captured before the quick-key.
+-- Restore only an empty right-hand slot; never overwrite a newer weapon.
 local function restoreQuickkeyWeaponIfEmpty()
     local wanted = Stance.nativeQuickkeyWeapon
     if not wanted or not wanted.isValid or not wanted:isValid() then return end
@@ -1965,13 +1950,8 @@ local function restoreQuickkeyWeaponIfEmpty()
     types.Actor.setEquipment(self, equipment)
 end
 
--- The stance to put back when a quickkey-raised Spell stance is reverted.
--- While a quickkey cast is in flight its recorded pre-press stance is
--- authoritative: a spam press's previous-frame baseline (prePressStance) is
--- captured at the end of onFrame, so the engine's own late raise — the very
--- thing being reverted — can already be in it, and reverting to it would leave
--- the weapon sheathed (Spell is never a valid target, so it degrades to
--- Nothing instead of the Weapon the player had out).
+-- In-flight quickkey cast's recorded pre-press stance wins: the prev-frame
+-- baseline may already contain the engine's late Spell raise.
 function Stance.quickkeyRevertTarget()
     local target = Stance.postCastRestore
         or QuickkeyPress.prePressStance
@@ -1982,21 +1962,8 @@ function Stance.quickkeyRevertTarget()
     return target
 end
 
---- Puts the player's stance back once a quickkey cast has finished.
----
---- The engine raises Spell stance when it applies a Magic / MagicItem quickkey,
---- and on the way there it sheaths a drawn weapon. Both revert paths in the
---- quickkey handler are scoped to a *pending* press — `QuickkeyPress.slot` is
---- cleared the moment the press resolves — so a press that does resolve into a
---- cast was left in the stance the engine put it in: weapon sheathed, magic
---- hands readied, until the player pressed something else. Nothing was visible
---- when no weapon was drawn, because the pre-press stance was already Nothing
---- and reverting to it is a no-op — which is why the symptom only ever showed
---- up with a weapon out.
----
---- Scoped the same way as the rest of the stance blockade: only while the
---- SuppressSpellStance setting is on, never against a stance the player opened
---- by hand, and only when the stance really is the engine's Spell raise.
+-- Restore the pre-press stance after a quickkey cast.
+-- Only with SuppressSpellStance on, and only against the engine's Spell raise.
 local function restoreStanceAfterCast(reason)
     local target = Stance.postCastRestore
     Stance.postCastRestore = nil
@@ -2006,9 +1973,7 @@ local function restoreStanceAfterCast(reason)
         clearQuickkeyStanceSuppression()
         return
     end
-    -- The update mirror may already have put a late native raise back down.
-    -- The weapon restoration is still needed in that case, even though there
-    -- is no Spell stance left to switch.
+    -- Mirror may have already lowered the stance; weapon restore still needed.
     if types.Actor.getStance(self) ~= STANCE.Spell then
         restoreQuickkeyWeaponIfEmpty()
         return
@@ -2016,24 +1981,33 @@ local function restoreStanceAfterCast(reason)
     if target == STANCE.Spell then target = STANCE.Nothing end
     debugLog("[OSSC Stance] Restoring post-cast stance (" .. tostring(reason or "") .. ")")
     types.Actor.setStance(self, target)
-    -- Restoring Weapon stance would normally play Item Weapon ... Up.
-    -- Keep the weapon visible with no draw sound when suppression is on.
     Stance.suppressWeaponTransitionSounds()
-    -- The native quick-key may have hidden/cleared the original weapon while
-    -- it raised Spell stance.  Put it back only when the slot is empty; a
-    -- different weapon equipped during the cast is authoritative.
+    -- Put the original weapon back only if the slot is empty.
     restoreQuickkeyWeaponIfEmpty()
     -- Keep the pre-toggle intent reference exact for the next frame.
     Stance.prevStance = target
 end
 
+-- ReAnimation can leave the bow's mesh detached when its bow animation is
+-- interrupted by an OSSC cast. Reassert the *same* right-hand bow at cast end
+-- so OpenMW rebuilds the weapon attachment. This is deliberately limited to a
+-- still-equipped bow: it never restores a weapon the player changed mid-cast.
+local function refreshBowEquipmentAfterCast()
+    if getExcludedWeaponGroup() ~= 'bowandarrow' then return end
+    local equipment = types.Actor.getEquipment(self)
+    local bow = equipment and equipment[SLOT.CarriedRight]
+    if not bow or not bow.isValid or not bow:isValid() then return end
+    equipment[SLOT.CarriedRight] = nil
+    types.Actor.setEquipment(self, equipment)
+    equipment[SLOT.CarriedRight] = bow
+    types.Actor.setEquipment(self, equipment)
+    debugLog('Reasserted equipped bow after quick-cast to restore its mesh attachment')
+end
+
 local function animUnlock(reason)
     if not Cast.isCasting then return end
     debugLog("AnimUnlock: " .. (reason or ""))
-    -- Quick-slot throttling is animation-bound, not wall-clock-bound. Release
-    -- the gate only when the cast animation reports its terminal stop key.
-    -- This prevents key spam from launching the native quickkey animation
-    -- repeatedly during the gesture, regardless of animation speed.
+    -- Quick-slot throttle releases on the stop key, not a timer.
     QuickkeyPress.cooldownActive = false
     if Cast.ngardeParryControlActive then setNgardeParryControl(false) end
     Cast.isCasting           = false
@@ -2042,6 +2016,7 @@ local function animUnlock(reason)
     restoreShieldAfterCast()
     disableCombatBlock()
     restoreStanceAfterCast(reason)
+    refreshBowEquipmentAfterCast()
     self:sendEvent('OSSC_CastingState', { isCasting = Cast.isCasting })
 end
 
@@ -2061,12 +2036,7 @@ local function fullCleanup(reason)
     animUnlock(reason)
 end
 
--- Resolves a deferred (after-cast) PMM recall to the picked mark: queues the
--- recall launch that was held back at the 'release' text key and releases the
--- cast lock. Only called when the player actually picked a mark — every other
--- way of leaving the window (Esc, X, "Latest", window unavailable) cancels
--- the recall instead, because the vanilla mark must not go through. Safe to
--- call more than once — only the first call queues the launch.
+-- Resolve a deferred PMM recall to the picked mark. Idempotent.
 resolvePMMRecall = function(reason)
     if not Cast.hasFiredThisCast then
         Cast.hasFiredThisCast = true
@@ -2085,9 +2055,7 @@ resolvePMMRecall = function(reason)
     animUnlock(reason)
 end
 
--- ── NEW — Eternal Grimoire helpers ─────────────────────────────────────────
---
--- Returns true when 'eternal_grimoire' is in the CarriedLeft (shield/light) slot.
+-- ── Eternal Grimoire helpers ──
 local function hasEternalGrimoire()
     local equipment = types.Actor.equipment(self)
     if not equipment then return false end
@@ -2107,8 +2075,7 @@ local function grimoireConditionMet()
     return hasEternalGrimoire() and not isInSpellStance()
 end
 
--- Starts the egidle2 loop at Default priority (so any Scripted cast
--- will visually override it without cancelling the underlying cycle).
+-- Default priority so Scripted casts override without cancelling the loop.
 local function startGrimoireIdle()
     if Stance.isGrimoireIdlePlaying then return end
     Stance.isGrimoireIdlePlaying = true
@@ -2176,14 +2143,8 @@ local function resolveEnchantedItemSpell(item)
     return nil
 end
 
--- ── Swimming gate for target-range quick-casts ────────────────────────────
--- While the caster is SWIMMING, quick-casts whose effects include a Target
--- range must not start. "Swimming" is the engine's own definition, reported
--- by types.Actor.isSwimming: the water level is above fSwimHeightScale
--- (≈ 0.9) of the character's height — the WHOLE body is in the water. Merely
--- wading through shallows (feet in water) does NOT count, so the gate only
--- trips when the character is actually swimming. Self and Touch casts stay
--- available while swimming.
+-- ── Swimming gate for target-range quick-casts ──
+-- types.Actor.isSwimming: whole body in water (wading does not count).
 local function isSwimmingActor(actor)
     return types.Actor.isSwimming(actor)
 end
@@ -2200,12 +2161,15 @@ end
 
 -- ── Shared cast startup function ──────────────────────────────────────────
 local function triggerQuickCast(opts)
-    -- A quick-key resolve sets this for the cast it is about to start. Read it
-    -- here, before any early return, so a refused cast cannot leave it set for
-    -- the dedicated Quick Cast button.
+    -- Read before any early return so a refused cast cannot leave it set.
     local exemptWeaponTransition = Cast.exemptWeaponTransitionBlock == true
     local transitionBaseline = Cast.combatAnimsAtPress
     Cast.exemptWeaponTransitionBlock = false
+    -- The stance a quickkey press started from, captured before the native
+    -- quickkey raised its transient Spell stance (see
+    -- Stance.beginQuickkeyCastAttempt).
+    local pressStance = Stance.quickkeyCastStance
+    Stance.quickkeyCastStance = nil
     local ignoreUIMode = opts and opts.ignoreUIMode
     local ignoreWorldPause = opts and opts.ignoreWorldPause
     local uiMode = (ui and ui.activeMode)
@@ -2214,7 +2178,38 @@ local function triggerQuickCast(opts)
         if Cast.isCasting then
             debugLog("Input rejected — cast in progress (currentAnimGroup=" ..
                 tostring(Cast.currentAnimGroup) .. ")")
+        else
+            self:sendEvent('OSSC_CastingState', { isCasting = false })
         end
+        return
+    end
+    -- ── No quick-cast from Spell stance ──
+    -- The engine's Spell stance is its own cast, and OSSC's blended quick-cast
+    -- animation on top of it made the two gestures fight for the same arms.
+    -- Nothing starts here: no animation, no cost, no launch. The player leaves
+    -- Spell stance (or OSSC's own quickkey window puts the stance back down)
+    -- and the next quick-cast works as usual. A quickkey press is judged by the
+    -- stance the player stood in BEFORE the native quickkey ran, because the
+    -- engine raises Spell stance itself as part of that press.
+    local castStance = pressStance or types.Actor.getStance(self)
+    -- Allow Quick-Cast In Spell Stance (off by default): with it on, a cast
+    -- that starts from the engine's Spell stance takes the stance over instead
+    -- of being refused (see Stance.releaseSpellStanceForCast).
+    local castInSpellStance = allowCastInSpellStance()
+    if castInSpellStance and castRulesModule.blocksForSpellStance(castStance) then
+        Stance.releaseSpellStanceForCast()
+        debugLog("Cast allowed — Spell stance quick-cast enabled")
+    end
+    if not castRulesModule.quickcastStanceAllowed(castStance, castInSpellStance) then
+        debugLog("Cast blocked — Spell stance: leave spell stance to quick-cast")
+        self:sendEvent('OSSC_CastingState', { isCasting = false })
+        return
+    end
+    -- Vanilla does not allow a cast while player magic is disabled or while
+    -- the player is in werewolf form.
+    if not types.Player.getControlSwitch(self, types.Player.CONTROL_SWITCH.Magic)
+        or types.NPC.isWerewolf(self) then
+        debugLog("Cast blocked — magic disabled or werewolf")
         self:sendEvent('OSSC_CastingState', { isCasting = false })
         return
     end
@@ -2233,7 +2228,7 @@ local function triggerQuickCast(opts)
     end
 
     if Cfg.general and Cfg.general:get('BlockDuringCombatAnims') then
-        for _, groupName in ipairs(COMBAT_ANIM_GROUPS) do
+        for _, groupName in ipairs(Anim.COMBAT_ANIM_GROUPS) do
             -- Any playing combat animation blocks quick-casting. A bow/crossbow
             -- shot blocks for its WHOLE duration — draw/aim and the
             -- follow-through after the projectile is away — so a quick 1-tap
@@ -2260,9 +2255,7 @@ local function triggerQuickCast(opts)
                 debugLog("Cast allowed through quickkey weapon transition: " .. groupName)
             end
         end
-        -- A held attack charge parks the weapon animation on a text key, so
-        -- the isPlaying() loop above misses it: also block while the attack
-        -- button is held down with a weapon from an excluded group.
+        -- Held charge parks on a text key, so isPlaying() misses it.
         local heldGroup = isAttackUseHeld() and getExcludedWeaponGroup() or nil
         if heldGroup then
             debugLog("Cast blocked — holding attack charge with excluded weapon: " .. heldGroup)
@@ -2271,11 +2264,7 @@ local function triggerQuickCast(opts)
         end
     end
 
-    -- NGarde parry block: while the player is holding up a parry guard (or is
-    -- in the wind-up to raise it), a quick-cast must not start — the hands are
-    -- committing to a block and the cast would play over the guard. No-op when
-    -- NGarde is absent (I.NGardePlayer is only registered by NGarde's own
-    -- player script) or the player is not parrying.
+    -- NGarde parry block; no-op when NGarde is absent.
     if Cfg.general and Cfg.general:get('BlockDuringNGardeParry') then
         local parrying = false
         if I.NGardePlayer then
@@ -2298,7 +2287,7 @@ local function triggerQuickCast(opts)
         fullCleanup(msg or "aborted")
     end
 
-    for _, groupName in ipairs(INCAPACITATED_GROUPS) do
+    for _, groupName in ipairs(Anim.INCAPACITATED_GROUPS) do
         if anim.isPlaying(self, groupName) then return abortCast("incapacitated") end
     end
 
@@ -2393,15 +2382,34 @@ local function triggerQuickCast(opts)
     end
     if not spellRec then return abortCast("no spell record") end
 
-    -- ── Swimming gate (vanilla parity) ─────────────────────────────────────
-    -- Target-range quick-casts attempted while swimming are NOT refused here
-    -- any more. Vanilla lets the cast gesture play and consumes the magicka;
-    -- the spell itself always fails. The fizzle therefore happens at the
-    -- RELEASE moment, in the pending-launch executor below: the launch is
-    -- vetoed and the vanilla "Spell Failure" sound plays. No message is
-    -- shown. ("Swimming" is the engine's own definition — types.Actor
-    -- .isSwimming, water above fSwimHeightScale ≈ 0.9 of body height, the
-    -- WHOLE body in the water; wading with feet wet does not count.)
+    -- ── Mod cast veto ──────────────────────────────────────────────────────
+    -- Another mod's own rule about what may be cast (Sane Magic's skill caps,
+    -- a school restriction, a charge check…). Asked here, before anything is
+    -- played or paid, and it covers spells, scrolls and enchanted items
+    -- alike — the vanilla `Use` path a mod like that gates on never runs for a
+    -- quick-cast, which is exactly why scrolls used to leak through. Only an
+    -- explicit `false` refuses; the reason is logged and the handler's message
+    -- (if any) is shown. See ossc_cast_rules.lua for the payload.
+    if castRulesModule.hasCastVeto() then
+        local payload = castRulesModule.castPayload(activeSpell, {
+            source = opts and opts.castSource or 'hotkey',
+            caster = self,
+            charge = activeSpell.item and getEnchantmentCost(activeSpell) or nil,
+        })
+        local vetoAllowed, vetoReason, vetoMessage =
+            castRulesModule.checkCastVeto(payload)
+        if not vetoAllowed then
+            return castRulesModule.reportVetoedCast(self, payload, vetoReason,
+                vetoMessage, {
+                    log         = debugLog,
+                    showMessage = ui.showMessage,
+                    fizzle      = Cfg.general
+                        and Cfg.general:get('CastVetoFeedback') ~= 'Silent',
+                })
+        end
+    end
+
+    -- Swimming target-range casts fizzle at release (pending-launch executor), not here.
 
     if spellRec.type == SPELL_TYPE.Power then
         if not (Cfg.general and Cfg.general:get('AllowPowerCasting')) then
@@ -2409,7 +2417,11 @@ local function triggerQuickCast(opts)
             return abortCast("power blocked")
         end
         local readyTime = OSSC_PowerCooldowns[spellId]
-        if readyTime and core.getGameTime() < readyTime then
+        local actorSpellList = types.Actor.spells(self)
+        local engineCanUsePower = not (actorSpellList
+            and type(actorSpellList.canUsePower) == 'function')
+            or actorSpellList:canUsePower(spellId)
+        if (readyTime and core.getGameTime() < readyTime) or not engineCanUsePower then
             ui.showMessage(GMST.sPowerAlreadyUsed)
             return abortCast("power on cooldown")
         end
@@ -2428,9 +2440,7 @@ local function triggerQuickCast(opts)
     if isPMMCompatEnabled() and isPMMInstalled() then
         PMM.isCurrentCastMark, PMM.isCurrentCastRecall = checkMarkRecall(Cast.currentSpell)
         if PMM.isCurrentCastRecall and #PMM.pmmLocations > 1 then
-            -- After-cast window: let the full cast animation play first and
-            -- open the multi mark selection window only after the casting
-            -- happens (on the animation's 'stop' text key).
+            -- After-cast window: open the mark window on the 'stop' key.
             PMM.pmmDeferredRecall = true
             debugLog('[OSSC PMM] Recall cast — multi mark window will open after the cast')
         end
@@ -2501,34 +2511,21 @@ local function triggerQuickCast(opts)
     Cast.hasQueuedLaunch  = false
     Cast.startKeyCastId   = nil
     Cast.costPaidCastId   = nil
-    -- Cast.pendingLaunches is deliberately NOT reset here. Any entry still in
-    -- the queue belongs to a PREVIOUS cast that was already paid and released
-    -- but whose launch has not executed yet (it fires on the next onUpdate).
-    -- Resetting the table dropped that launch and its spell while the magicka
-    -- stayed consumed — a spam press landing in the one-frame gap between the
-    -- previous cast's unlock and its launch cost double the magicka. The
-    -- executor below fires every due entry, whatever cast it belongs to.
+    -- Do NOT reset pendingLaunches: a previous paid cast's launch may still be queued.
     Cast.currentCastId = Cast.currentCastId + 1
     Cast.castStartTime = now
     Cast.isBound2HWeaponCast = hasBound2HWeaponEffect(activeSpell)
     suppressShieldDuringCast()
-    -- Publish the hand-occupancy state before any animation/control callback
-    -- can run.  Previously currentAnimGroup was assigned after the combat
-    -- locks were enabled, leaving a frame in which a held 2H attack could
-    -- start before the lock considered the cast active.
+    -- Publish before any callback runs, so no frame lets a held 2H attack start.
     Cast.currentAnimGroup = animGroup
     enableCombatBlock()
     reconcileWeaponAttackLock()
-    -- The guard-at-cast-start check has already passed. Lock NGarde now so a
-    -- later parry input cannot overlay the weapon guard on this cast.
+    -- Lock NGarde so a later parry cannot overlay this cast.
     setNgardeParryControl(true)
     self:sendEvent('OSSC_CastingState', { isCasting = Cast.isCasting })
     self:sendEvent('MagExp_SetPendingCastSpellId', { spellId = spellId })
 
-    -- Re-arming safety unlock: while the PMM recall UI is open the cast is
-    -- intentionally on hold, so a one-shot timer would expire uselessly and
-    -- never run again. Keep re-arming until the cast actually resolves, and
-    -- after the UI closes give the resumed animation its full grace window.
+    -- Re-arming safety unlock: keep re-arming while the PMM UI holds the cast.
     local safetyUnlockCastId = Cast.currentCastId
     local safetyUnlockTick
     safetyUnlockTick = function()
@@ -2544,18 +2541,11 @@ local function triggerQuickCast(opts)
             return
         end
         if PMM.pmmDeferredRecall then
-            -- Neither the 'release' nor the 'stop' text key fired (some
-            -- animation groups — e.g. qcsnap — only carry 'start'/'release'),
-            -- so the window was never opened. Open it now as the last-resort
-            -- fallback instead of force-cleaning the held recall.
+            -- No release/stop key fired (e.g. qcsnap): open the window as last resort.
             debugLog("Safety unlock timer fired — opening PMM multi mark window (no cast text key)")
             openPMMRecallWindow()
             if not PMM.isWaitingForPMMInput then
-                -- Window failed to load: cancel — the vanilla mark must not
-                -- go through while Pure Multi Mark Compatibility is enabled.
-                -- (Success is signalled by isWaitingForPMMInput staying true;
-                -- pmmDeferredRecall stays true until the recall resolves, so
-                -- it cannot be used to detect the failure here.)
+                -- Window failed: cancel; the vanilla mark must not go through.
                 PMM.pmmSelectedDestination = nil
                 PMM.pmmVanillaRecall = false
                 fullCleanup('PMM window unavailable — recall cancelled')
@@ -2580,30 +2570,8 @@ local function triggerQuickCast(opts)
     async:newUnsavableSimulationTimer(scaledSafetyUnlockDelay, safetyUnlockTick)
 
     Cast.currentAnimGroup = animGroup
-    -- Per-bone-group priorities via buildCastBlendOptions:
-    -- openmw.animation.playBlended seeds unlisted groups with
-    -- PRIORITY.Default (0), so every bone in the blend mask must be
-    -- listed. The split is:
-    --   Arms + Torso = PRIORITY.Hit (6) when no 1H swing is in flight.
-    --   Beats Weapon-stance idles (idle1h / idletwohand / … at Default
-    --   0 / Movement 5) so a two-hander's grip cannot pin the casting
-    --   arm, but stays below PRIORITY.Weapon (7) so a real weapon
-    --   attack that starts mid-cast still wins the bones.
-    --   When a 1H / H2H / thrown attack is already mid-swing (or a 1H
-    --   charge is held), RightArm + Torso are left OUT of the mask so
-    --   the cast cannot steal those bones and freeze the attack mid-
-    --   animation. The cast then plays on LeftArm only (OSSC casts are
-    --   left-hand flicks).
-    --   The same LeftArm-only mask is used in relaxed stance (Nothing /
-    --   nil — weapon sheathed, nothing readied): no grip idle pins the
-    --   casting arm there, so claiming RightArm/Torso would only freeze
-    --   the weapon hand stiff for the whole cast. The grimoire's
-    --   right-hand cast ('eqcastr') is exempt — it needs RightArm.
-    --   LowerBody = PRIORITY.WeaponLowerBody (1). Below PRIORITY.
-    --   Movement (5), so locomotion keeps owning the legs. A biped's
-    --   world position comes from the root motion of whatever owns the
-    --   LowerBody mask: at Scripted (13) walk/run was paused and the
-    --   zero-root-motion cast anim froze movement for the whole cast.
+    -- playBlended seeds unlisted groups at PRIORITY.Default: list every masked bone.
+    -- LowerBody must stay below Movement or locomotion freezes during the cast.
     local blendOpts = buildCastBlendOptions(finalSpeed, animGroup)
     if I.AnimationController and I.AnimationController.playBlendedAnimation then
         I.AnimationController.playBlendedAnimation(animGroup, blendOpts)
@@ -2632,33 +2600,14 @@ end
 
 
 
--- ── Crosshair look target (rendering ray, cached in onFrame) ───────────────
--- Vanilla determines a Touch spell's target from the crosshair with a
--- RENDERING ray (World::getFocusObject -> castCameraToViewportRay), i.e. it
--- hits exactly what the player sees — including thin door panels and chests
--- whose convex physics shape does not cover what the crosshair is on.
---
--- OpenMW only permits nearby.castRenderingRay while processing input/frame
--- events; calling it from an onUpdate engine handler throws. But OSSC launches
--- its casts from onUpdate, where the only legal query is nearby.castRay — a
--- physics ray against convex collision shapes. That ray reliably misses many
--- Doors/Containers the player is plainly aiming at (and reports the door frame
--- or terrain instead), so MagExp never receives a types.Door/types.Container
--- hitObject and its lock/unlock (Open/Lock) handler never runs.
---
--- This mirrors the framework's own SharedRay pattern (and the engine's focus
--- object): cast the rendering ray once per frame in onFrame and cache the
--- result; the onUpdate cast path consumes it, with a physics castRay kept as a
--- same-context fallback.
+-- ── Crosshair look target (rendering ray, cached in onFrame) ──
+-- castRenderingRay throws outside frame/input events; onUpdate gets the cache,
+-- with a physics castRay fallback (misses many doors/containers).
 local cachedLookRay = { hit = false, hitPos = nil, hitNormal = nil, hitObject = nil }
 local cachedLookStart = nil
 local cachedLookEnd   = nil
 
--- The forward the *rendered view* looks along, from the angles the engine
--- builds that view out of (camera.getOrient() = roll * pitch * yaw applied to
--- +Y, mwrender/camera.cpp). Roll spins the picture around this axis, it never
--- moves it, so yaw and pitch -- including the extra angles a mod or the
--- knock-down camera adds -- are the whole story.
+-- Rendered-view forward from camera yaw/pitch (roll does not move it).
 local function cameraForwardFromAngles()
     local pitch    = -(camera.getPitch() + camera.getExtraPitch())
     local yaw      =   camera.getYaw()  + camera.getExtraYaw()
@@ -2669,43 +2618,9 @@ local function cameraForwardFromAngles()
         math.sin(pitch))
 end
 
--- ── The crosshair ray (origin, far end) ───────────────────────────────────
--- Everything that aims has to sit on ONE line: the line the crosshair is
--- drawn on. Origin and direction therefore have to come from the same view.
---
--- camera.viewportToWorldVector(0.5, 0.5) looks like it hands back that line
--- in one call, and on its own it does not. The engine returns
---
---     (invertedViewMatrix * (0, 0, -1)) - camera.getPosition()
---
--- -- the world point one unit in front of the camera, *measured from
--- camera.getPosition()*. Those are not the same camera. In first person the
--- view matrix is rebuilt during the cull traversal from the neck animation
--- with the position the head has this frame, while camera.getPosition()
--- still carries the head of the frame before it:
---
---     "It is a hack. Camera position depends on neck animation. [...] Note
---      that it becomes different from mPosition that is used in other parts
---      of the code."                              (mwrender/camera.cpp)
---
--- so what comes back is  forward + (renderedCamera - camera.getPosition())  --
--- a *direction* skewed by a position difference. That is not the harmless
--- error a shifted origin would be. The spell leaves the casting hand and is
--- converged on the point this ray finds, so a skewed direction tilts the
--- whole trajectory away from the crosshair and the miss grows with every unit
--- it flies: dead on across a room, a hand's width to one side of a wall 60
--- metres off, always to the same side because a cast animation always moves
--- the head the same way.
---
--- So each half is taken from where it is exact:
---   * the direction is the camera orientation -- the very forward the view
---     matrix is built from (see above);
---   * the origin is camera.getPosition() moved onto the rendered camera by
---     the difference the engine's own vector reports, so the two describe
---     the same view again. The correction is only applied while it is on the
---     scale of a camera moving inside one frame; anything larger means this
---     build scales the vector differently, and the derived ray (parallel to
---     the crosshair, off by that same small distance) is kept instead.
+-- ── The crosshair ray (origin, far end) ──
+-- viewportToWorldVector is skewed in first person (view matrix uses this frame's head,
+-- getPosition() the last): direction from orientation, origin corrected by that offset.
 local function getCameraAimRay()
     local camPos  = camera.getPosition()
     local forward = cameraForwardFromAngles()
@@ -2733,14 +2648,10 @@ local function refreshLookRay()
     cachedLookStart = camPos
     cachedLookEnd   = rayEnd
 
-    -- castRenderingRay is only legal in a frame context, and refreshLookRay()
-    -- is called from onFrame alone, so the call is legal here. A nil result
-    -- still just means "no hit this frame".
+    -- Legal: refreshLookRay() is called only from onFrame.
     local res = nearby.castRenderingRay(camPos, rayEnd, { ignore = self })
     if not res then
-        -- Rendering ray unavailable this frame (e.g. called outside a frame
-        -- context). Leave the previous cache intact; onUpdate will fall back
-        -- to its physics ray.
+        -- Not in a frame context: keep the cache; onUpdate falls back.
         return
     end
     cachedLookRay = {
@@ -2751,10 +2662,7 @@ local function refreshLookRay()
     }
 end
 
--- Returns a ray result for the crosshair look target. Prefers the rendering
--- ray cached in onFrame (what the player actually sees — the engine's own
--- touch/activation target); falls back to a physics castRay, which is the only
--- raycast legal from this onUpdate context.
+-- Cached rendering ray, else physics castRay (the only ray legal in onUpdate).
 local function getLookTargetRay(cameraPos, endPos)
     if cachedLookRay and cachedLookRay.hit and cachedLookRay.hitPos then
         return {
@@ -2775,113 +2683,50 @@ local function getLookTargetRay(cameraPos, endPos)
 end
 
 -- OpenMW combat.cpp getHitContact fallback for touch spells:
--- If the crosshair ray did not hit a valid living actor, find the nearest living actor
--- within melee reach (fCombatDistance * fHandToHandReach) and within the combat tolerance
--- angles (derived from fCombatAngleXY / 90.0 and fCombatAngleZ / 90.0) with line of sight.
-local function getHitContactActor(cameraPos)
-    local reach = GMST.fCombatDistance * GMST.fHandToHandReach
-    local fCombatAngleXY = GMST.fCombatAngleXY / 90.0
-    local fCombatAngleZ = GMST.fCombatAngleZ / 90.0
-
-    local actorPos = self.position
-    local eyePos = cameraPos or (actorPos + util.vector3(0, 0, 100))
+-- When the crosshair ray did not hit a valid living actor, the engine looks for
+-- the nearest living actor within reach (fCombatDistance — NOT multiplied by
+-- fHandToHandReach) and inside the combat tolerance angles (fCombatAngleXY / 90
+-- and fCombatAngleZ / 90) with line of sight. That tolerance is what makes a
+-- touch spell land on a skeleton you only roughly aimed at, so it must follow
+-- the engine's numbers exactly — see scripts/ossc/ossc_cast_rules.lua.
+--
+-- The player is the only caster that can look up, so the vertical angle is the
+-- look pitch; the horizontal direction is the camera yaw. The eye point stays
+-- the player's own (vanilla eye level), never the camera: third person puts the
+-- camera metres behind the body and the engine measures from the actor.
+local function getHitContactActor()
     local pitch = -(camera.getPitch() + camera.getExtraPitch())
-    local yaw = camera.getYaw() + camera.getExtraYaw()
-    local actorDirXY = util.vector3(math.sin(yaw), math.cos(yaw), 0):normalize()
-    local actorVerticalAngle = math.sin(pitch)
-
-    local selfHalfZ = 0
-    local selfHalfY = 0
-    if self.getBoundingBox then
-        local selfBBox = self:getBoundingBox()
-        if selfBBox and selfBBox.halfSize then
-            selfHalfZ = selfBBox.halfSize.z
-            selfHalfY = selfBBox.halfSize.y
-        end
-    end
-
-    local canMoveByZ = isSwimmingActor(self)
-    if not canMoveByZ then
-        local levitate = types.Actor.activeEffects(self):getEffect(core.magic.EFFECT_TYPE.Levitate)
-        if levitate and levitate.magnitude > 0 then
-            canMoveByZ = true
-        end
-    end
-
-    local bestActor = nil
-    local minDist = math.huge
-
-    local actorsList = nearby.actors or {}
-    for _, target in ipairs(actorsList) do
-        if target ~= self and not types.Actor.isDead(target) then
-            local targetPos = target.position
-            local targetHalfZ = 0
-            local targetHalfY = 0
-            if target.getBoundingBox then
-                local targetBBox = target:getBoundingBox()
-                if targetBBox and targetBBox.halfSize then
-                    targetHalfZ = targetBBox.halfSize.z
-                    targetHalfY = targetBBox.halfSize.y
-                end
-            end
-
-            local dist = (targetPos - actorPos):length() - selfHalfY - targetHalfY
-            if dist < 0 then dist = 0 end
-
-            local heightDiff = math.abs(actorPos.z - targetPos.z)
-            if dist < minDist and dist < reach and heightDiff < reach then
-                local dx = targetPos.x - actorPos.x
-                local dy = targetPos.y - actorPos.y
-                local lenXY = math.sqrt(dx * dx + dy * dy)
-                if lenXY > 0 then
-                    local targetDirXYx = dx / lenXY
-                    local targetDirXYy = dy / lenXY
-
-                    -- Must be in front (dot product > 0)
-                    local dotFront = targetDirXYx * actorDirXY.x + targetDirXYy * actorDirXY.y
-                    if dotFront > 0 then
-                        -- Horizontal tolerance: perp dot product <= fCombatAngleXY
-                        local perpDot = math.abs(targetDirXYx * actorDirXY.y - targetDirXYy * actorDirXY.x)
-                        if perpDot <= fCombatAngleXY then
-                            local zCheckPassed = true
-                            if not canMoveByZ then
-                                local targetFeet = targetPos - eyePos
-                                local targetHead = targetFeet + util.vector3(0, 0, targetHalfZ * 2.0)
-                                local feetLen = targetFeet:length()
-                                local headLen = targetHead:length()
-                                local feetZ = feetLen > 0 and (targetFeet.z / feetLen) or 0
-                                local headZ = headLen > 0 and (targetHead.z / headLen) or 0
-
-                                if (actorVerticalAngle - headZ > fCombatAngleZ)
-                                    or (actorVerticalAngle - feetZ < -fCombatAngleZ) then
-                                    zCheckPassed = false
-                                end
-                            end
-
-                            if zCheckPassed then
-                                -- Check line of sight from eye to target center
-                                local targetCenter = targetPos + util.vector3(0, 0, targetHalfZ)
-                                local losRay = nearby.castRay(eyePos, targetCenter, { ignore = self })
-                                if not losRay.hit or losRay.hitObject == target
-                                    or (losRay.hitPos and (losRay.hitPos - targetCenter):length() < 30) then
-                                    minDist = dist
-                                    bestActor = target
-                                end
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    return bestActor
+    local yaw   =   camera.getYaw()   + camera.getExtraYaw()
+    return require('scripts.ossc.ossc_cast_rules').findTouchContact(self, {
+        dirXY    = util.vector3(math.sin(yaw), math.cos(yaw), 0),
+        pitchSin = math.sin(pitch),
+    })
 end
 
 -- Forward declaration: processPendingLaunches is defined after onUpdate (split
 -- out to stay under LuaJIT's 60-upvalue cap). Without this, the call at the
 -- end of onUpdate resolves to a nil global and fails every frame.
 local processPendingLaunches
+
+-- ── Moving-target lead: crosshair sampling ─────────────────────────────────
+-- Every simulation tick, feed the actor currently under the crosshair to the
+-- lead tracker, so an eligible target-range quick-cast released later has
+-- ≥0.25 s of movement history to estimate velocity from (the engine's AI does
+-- the same for its combat target via AiCombatStorage::mLastTargetPos).
+--
+-- Deliberately NOT gated on the stance: a cast can start from Weapon stance or
+-- relaxed hands (never from Spell stance, which sits out — see
+-- ossc_cast_rules.quickcastStanceAllowed) and the lead must be there for both.
+-- Runs from its own function to keep onUpdate's upvalue budget intact (LuaJIT
+-- caps functions at 60).
+local function updateLeadTracking()
+    local hitObj = cachedLookRay.hit and cachedLookRay.hitObject or nil
+    if not hitObj or hitObj == self then return end
+    local hitType = hitObj.type
+    if hitType ~= types.NPC and hitType ~= types.Creature then return end
+    if types.Actor.isDead(hitObj) then return end
+    targetLead.track(hitObj, core.getSimulationTime())
+end
 
 -- ── onUpdate ──────────────────────────────────────────────────────────────
 local function onUpdate(dt)
@@ -2890,6 +2735,10 @@ local function onUpdate(dt)
     -- equipped weapon and the settings.
     reconcileCombatBlock()
     reconcileWeaponAttackLock()
+
+    -- Track the crosshair actor for the moving-target lead (cheap: one linear
+    -- scan over ≤8 tracked actors per tick).
+    updateLeadTracking()
 
     -- ── Stance-suppression mirror (late-frame raisers) ─────────────────────
     -- A quickkey press can raise the stance AFTER onFrame has run — an async
@@ -2904,7 +2753,8 @@ local function onUpdate(dt)
     -- quickkey-raised stances, and a stance the player opened by hand
     -- (spellStanceAllowed) is never touched, whatever the setting.
     if Cfg.general and Cfg.general:get('SuppressSpellStance') == true
-        and not Stance.spellStanceAllowed then
+        and not Stance.spellStanceAllowed
+        and not allowCastInSpellStance() then
         local updateStance = types.Actor.getStance(self)
         if updateStance == STANCE.Spell then
             -- A late raise can be the ONLY signal a magic quickkey press ever
@@ -2929,17 +2779,7 @@ local function onUpdate(dt)
                 debugLog("[OSSC Hotkey] Quickkey Spell stance raise observed "
                     .. "in update phase — magic hotkey confirmed")
             end
-            -- Quickkey-only scope: put the raise back down ONLY inside the
-            -- quickkey window — a pending press, or a cast a quickkey started
-            -- that is still in flight. The engine re-applies a quickkey (and
-            -- re-raises the stance with it) while its own cast runs, so
-            -- without the cast half of the window the spell stance stood on
-            -- screen for the whole gesture — the reported "spamming the
-            -- quickkey still turns spell stance on". A stance raised any
-            -- other way (R key, menu, inventory, hotbar click, another mod)
-            -- is the player's own doing and is left up: with the window
-            -- closed, nothing here can touch any stance, so the manual stance
-            -- can never be eaten across the frame.
+            -- Revert only inside the quickkey window (pending press or in-flight quickkey cast); manual stances stay up.
             if Stance.quickkeyWindowActive() then
                 debugLog("[OSSC Stance] Late Spell stance raise reverted (update mirror)")
                 types.Actor.setStance(self, Stance.quickkeyRevertTarget())
@@ -2950,12 +2790,8 @@ local function onUpdate(dt)
         end
     end
 
-    -- A magic quick-key can be delivered in several engine phases: the native
-    -- selection may raise Spell after onFrame, OSSC may resolve the press on a
-    -- later frame, and the engine can re-raise Spell while the custom cast is
-    -- still playing.  Do not retire the suppression flag merely because the
-    -- pending slot was consumed; keep the bounded window until a stable
-    -- non-Spell state is observed.  A manual stance key always wins.
+    -- Keep the window until a stable non-Spell state; consuming the pending slot is not enough.
+    -- A manual stance key always wins.
     if Stance.nativeQuickkeySuppression then
         local suppressionSettingOn = Cfg.general
             and Cfg.general:get('SuppressSpellStance') == true
@@ -2991,10 +2827,16 @@ local function onUpdate(dt)
         Stance.collapsedDrawGroup = nil
     end
     if shouldBlockHeavyAttack() then
-        for _, groupName in ipairs(HEAVY_ATTACK_GROUPS) do
+        local castRulesNow = require('scripts.ossc.ossc_cast_rules')
+        for _, groupName in ipairs(Anim.HEAVY_ATTACK_GROUPS) do
             -- The collapsed quick-key draw is not an attack. Cancelling it
             -- before the engine finishes the equip state drops the mesh again.
-            if groupName ~= Stance.collapsedDrawGroup and anim.isPlaying(self, groupName) then
+            -- The same rule covers any other draw in flight (a bound weapon
+            -- auto-equipped mid-cast, a mod-issued draw): the weapon mesh is
+            -- attached by the draw's own 'equip attach' key.
+            if groupName ~= Stance.collapsedDrawGroup
+                and not castRulesNow.isDrawPlaying(Stance.drawTracker, groupName)
+                and anim.isPlaying(self, groupName) then
                 debugLog("Cancelled " .. groupName .. " attack during quickcast (update)")
                 anim.cancel(self, groupName)
             end
@@ -3009,10 +2851,7 @@ local function onUpdate(dt)
         end
     end
 
-    -- The player, NPCs and eligible creatures must obey the same interruption rule:
-    -- if an incapacitation / stagger / knockdown state lands before the cast
-    -- has released, cancel the quickcast immediately instead of letting the
-    -- wind-up stay active until a later release/safety timer check.
+    -- Cancel an unreleased quickcast immediately on incapacitation/stagger/knockdown.
     if Cast.isCasting and not Cast.hasFiredThisCast and isQuickcastInterrupted() then
         debugLog("Quickcast cancelled — incapacitated mid-cast")
         fullCleanup("incapacitated mid-cast")
@@ -3062,34 +2901,22 @@ local function onUpdate(dt)
     if Cast.isCasting and PMM.isWaitingForPMMInput then
         local uiMode = (ui and ui.activeMode)
         if not uiMode and I.UI and I.UI.getMode then uiMode = I.UI.getMode() end
-        -- I.UI.setMode('Interface') is not reflected synchronously by getMode().
-        -- Wait briefly for the engine to enter Interface mode before treating
-        -- nil as a cancellation. Otherwise OSSC can destroy the PMM window on
-        -- the update immediately after creating it.
+        -- setMode('Interface') is not reflected by getMode() synchronously; wait before treating nil as cancel.
         if uiMode ~= 'Interface' and PMM.pmmUiOpenedAt
             and core.getSimulationTime() - PMM.pmmUiOpenedAt < 0.25 then
-            -- Let the cast animation finish on its own: the window only
-            -- opens after the 'release' key, so the casting already happened
-            -- and there is nothing left to hold back.
+            -- Window opens after 'release'; let the cast animation finish.
             Cast.castStartTime = core.getSimulationTime()
             return
         end
         if uiMode == 'Interface' then
-            -- Don't freeze the cast animation here. The window opens after
-            -- the 'release' key, but the animation may still be playing its
-            -- tail; pausing it would leave the actor stuck in the cast pose
-            -- after the cast lock is released.
+            -- Don't freeze the cast animation: the actor would stay stuck in the cast pose.
             for _, onFrameFunction in pairs(onFrameFunctions or {}) do
                 onFrameFunction(dt)
             end
             Cast.castStartTime = core.getSimulationTime()
             return
         else
-            -- Interface mode ended without a mark being picked (e.g. the
-            -- player pressed Esc). Make sure the window is gone and cancel
-            -- the cast: with Pure Multi Mark Compatibility enabled the
-            -- vanilla mark must not go through, so there is no fallback to
-            -- a standard Recall.
+            -- Closed without a pick: remove the window and cancel (no vanilla Recall under PMM compat).
             PMM.isWaitingForPMMInput = false
             PMM.pmmUiClosedAt = core.getSimulationTime()
             PMM.pmmUiOpenedAt = nil
@@ -3113,6 +2940,32 @@ local function onUpdate(dt)
 end
 
 -- ── Pending launches ────────────────────────────────────────────────────
+-- ── Moving-target lead: launch-site helper ─────────────────────────────────
+-- Returns the lead-adjusted launch direction for a target-range quick-cast at
+-- a living actor, or nil when this cast's private 50/50 decision declines lead
+-- or there is no fresh velocity history / usable intercept. Split into its
+-- own function so processPendingLaunches only gains one upvalue (LuaJIT's
+-- 60-upvalue cap); all engine cloning lives in ossc_target_lead.lua.
+--
+-- Stance-free by construction: this runs inside the single launch funnel
+-- every OSSC quick-cast goes through (hotkey button, quickkeys 1-9,
+-- quick-select slots, enchanted items/scrolls, safety-timer launches), which
+-- never branches on the stance — Weapon, Spell and relaxed stances all lead
+-- identically.
+local function leadLaunchDirection(spell, startPos, aimPoint, hitObject)
+    local now = core.getSimulationTime()
+    if not targetLead.shouldLead(self.id, now) then return nil end
+    return targetLead.launchDirection{
+        startPos      = startPos,
+        aimPoint      = aimPoint,
+        target        = hitObject,
+        effects       = spell.effects,
+        effectRecords = effectRecs,
+        now           = now,
+        gmstBaseSpeed = GMST.fTargetSpellMaxSpeed,
+    }
+end
+
 -- Split out of onUpdate: LuaJIT caps every function at 60 upvalues and
 -- onUpdate had grown past the cap. Same code, same order, own upvalue
 -- budget.
@@ -3125,24 +2978,18 @@ processPendingLaunches = function()
             table.remove(Cast.pendingLaunches, i)
             local spell = pl.spell
             if spell then
-                -- ── Stagger / knockdown interruption ─────────────────────
-                -- Vanilla cancels the cast when the caster is staggered; a
-                -- stagger or knock that lands mid-animation cancels the OSSC
-                -- cast here (before any cost is paid) instead of launching.
+                -- ── Stagger / knockdown interruption ──
+                -- Cancel before any cost is paid instead of launching.
                 if isStaggeredOrKnocked() then
                     debugLog("Launch cancelled — staggered or knocked mid-cast")
-                    -- Only the CURRENT cast's launch may tear the cast state
-                    -- down. A previous cast's late launch is simply dropped:
-                    -- fullCleanup here would kill the new cast that just
-                    -- started while the old launch was still queued.
+                    -- Only the current cast's launch may tear down state; a stale launch is dropped.
                     if pl.castId == Cast.currentCastId then
                         fullCleanup("staggered/knocked mid-cast")
                     end
                     break
                 end
 
-                -- `== false`, not `not`: a queued launch that carries no
-                -- isPaid field at all must not be read as "out of magicka".
+                -- `== false`, not `not`: a missing isPaid is not "out of magicka".
                 if pl.isPaid == false then
                     if pl.castId == Cast.currentCastId then
                         launchCleanup(spell.item and "not enough item charge"
@@ -3181,12 +3028,7 @@ processPendingLaunches = function()
                             local snd = effectRecs.recall and effectRecs.recall.hitSound or 'mysticism hit'
                             if snd == '' then snd = 'mysticism hit' end
                             ambient.playSound(snd, { volume = 0.9 })
-                            -- PMM_loadLoc is PMM's own teleport event (handled by
-                            -- PMM's global script). OSSC_PMMTeleport is handled by
-                            -- ossc_global.lua with identical logic, so the recall
-                            -- works even if PMM's global script is missing or
-                            -- disabled. Both teleport to the exact same spot; if
-                            -- both run, the second call is a no-op.
+                            -- PMM's own event plus OSSC's identical fallback (ossc_global.lua); the second is a no-op.
                             core.sendGlobalEvent('PMM_loadLoc', { self, selectedLocation })
                             core.sendGlobalEvent('OSSC_PMMTeleport', { self, selectedLocation })
                             debugLog(string.format(
@@ -3194,7 +3036,10 @@ processPendingLaunches = function()
                                 tostring(selectedLocation.name),
                                 tostring(selectedLocation.cell or
                                     (selectedLocation.gridX .. '/' .. selectedLocation.gridY))))
-                            if I.SkillProgression and I.SkillProgression.skillUsed then
+                            local recallMode = SkillModes.normalize(
+                                Cfg.general and Cfg.general:get('SkillProgressionMode'))
+                            if recallMode ~= 'none' and I.SkillProgression
+                                and I.SkillProgression.skillUsed then
                                 I.SkillProgression.skillUsed('mysticism', {
                                     skillGain = 3,
                                     useType = I.SkillProgression.SKILL_USE_TYPES.Spellcast_Success,
@@ -3202,17 +3047,14 @@ processPendingLaunches = function()
                             end
                             self:sendEvent('OSSC_OnSpellCast', { spellId = spell.id })
                         else
-                            -- The forward the view looks along — the same one the
-                            -- crosshair ray below is built from, so the casting
-                            -- hand is placed with the view that aims the spell.
+                            -- Same view forward the crosshair ray uses.
                             local cameraDir = cameraForwardFromAngles()
                             local flatForward = util.vector3(cameraDir.x, cameraDir.y, 0):normalize()
                             local leftDir     = util.vector3(-flatForward.y, flatForward.x, 0)
                             local startPos
                             if hasEternalGrimoire() then
-                                -- ── Grimoire spawn offsets (right-hand cast) ──────────
-                                -- One global set for all animations; see
-                                -- scripts/ossc/ossc_launch_offsets.lua to edit it.
+                                -- ── Grimoire spawn offsets (right-hand cast) ──
+                                -- Edit in scripts/ossc/ossc_launch_offsets.lua.
                                 local grimOff = launchOffsets.getGrimoire(camera.getMode() == camera.MODE.FirstPerson)
                                 if camera.getMode() == camera.MODE.FirstPerson then
                                     startPos = camera.getPosition()
@@ -3226,9 +3068,8 @@ processPendingLaunches = function()
                                         + leftDir * grimOff.left
                                 end
                             else
-                                -- ── Normal spawn offsets (left-hand cast) ─────────────
-                                -- Per-animation offsets; see scripts/ossc/ossc_launch_offsets.lua
-                                -- to tune every animation separately (1st and 3rd person).
+                                -- ── Normal spawn offsets (left-hand cast) ──
+                                -- Per-animation; edit in scripts/ossc/ossc_launch_offsets.lua.
                                 local castAnim = pl.animGroup or Cast.currentAnimGroup
                                 local off = launchOffsets.get(castAnim, camera.getMode() == camera.MODE.FirstPerson)
                                 if camera.getMode() == camera.MODE.FirstPerson then
@@ -3244,28 +3085,9 @@ processPendingLaunches = function()
                                 end
                             end
 
-                            -- Aim along the crosshair line as it is *now*, not the
-                            -- one cached when the frame started (see
-                            -- getCameraAimRay). The cache is from onFrame; the
-                            -- world update in between moves the camera, and the
-                            -- hand the spell leaves is read from the camera after
-                            -- that too. A line taken a frame early is a line the
-                            -- crosshair has already left: the launch converges on
-                            -- a point beside the one the player is aiming at, and
-                            -- a turned-away line (the player swinging round onto a
-                            -- target as the cast releases) misses by an angle --
-                            -- an error that grows with the distance to the target.
+                            -- Read the crosshair ray now, not the onFrame cache: the camera has moved since.
                             local cameraPos, endPos = getCameraAimRay()
-                            -- This code runs from onUpdate, where OpenMW does NOT
-                            -- permit castRenderingRay (it throws outside frame/input
-                            -- processing). Use the crosshair rendering ray cached in
-                            -- onFrame (refreshLookRay) — it hits exactly what the
-                            -- player sees, including thin Door/Container panels, and
-                            -- is the same targeting source vanilla uses for Touch
-                            -- spells (World::getFocusObject). A same-context physics
-                            -- castRay is used as a fallback when the cache is empty;
-                            -- it is also the query used by the off-centre Touch fan
-                            -- rays below.
+                            -- castRenderingRay throws in onUpdate: use the onFrame-cached ray, physics castRay as fallback.
                             local ray = getLookTargetRay(cameraPos, endPos)
                             debugLog(string.format("Raycast: hit=%s hitObject=%s", tostring(ray.hit), tostring(ray.hitObject and ray.hitObject.recordId or "nil")))
                             local range = RANGE.Target
@@ -3293,7 +3115,7 @@ processPendingLaunches = function()
                             end
                             local hitObject = nil
                             if range == RANGE.Touch and (not ray.hit or not ray.hitObject) then
-                                local contactActor = getHitContactActor(cameraPos)
+                                local contactActor = getHitContactActor()
                                 if contactActor then
                                     hitObject = contactActor
                                 else
@@ -3307,8 +3129,7 @@ processPendingLaunches = function()
                                     }
                                     for _, offset in ipairs(offsets) do
                                         local altEnd = endPos+offset
-                                        -- Same onUpdate restriction as the primary
-                                        -- query above: use the physics ray directly.
+                                        -- onUpdate: physics ray only.
                                         local altRay = nearby.castRay(cameraPos, altEnd, { ignore = self })
                                         if altRay.hit and altRay.hitObject then
                                             local t = altRay.hitObject.type
@@ -3337,45 +3158,17 @@ processPendingLaunches = function()
                                     end
                                 end
                             end
-                            -- Fallback: if touch spell hit an inanimate object (e.g. background wall/door/floor)
-                            -- or a dead actor instead of a living actor, run OpenMW's getHitContact fallback
-                            -- to find an eligible living target within reach and tolerance angles.
+                            -- Touch fallback: getHitContact for a living target when the ray hit an object or dead actor.
                             if range == RANGE.Touch and (not hitObject or (hitObject.type ~= types.NPC and hitObject.type ~= types.Creature)) then
-                                local contactActor = getHitContactActor(cameraPos)
+                                local contactActor = getHitContactActor()
                                 if contactActor then
                                     hitObject = contactActor
                                 end
                             end
                             local aimPoint       = ray.hit and ray.hitPos or endPos
                             local distFromPlayer = (aimPoint - self.position):length()
-                            -- ── Parallax convergence ──────────────────────────
-                            -- The spell does not leave the eye, it leaves the
-                            -- casting hand (startPos, up to ~80 units to the side
-                            -- of the camera). Aiming it at the crosshair point is
-                            -- therefore a convergence problem: the trajectory
-                            -- crosses the crosshair line exactly ONCE, at the
-                            -- point it was converged on. Before that point it is
-                            -- offset toward the hand, after it the same offset
-                            -- appears mirrored on the other side and keeps
-                            -- growing with distance.
-                            --
-                            -- So the convergence point has to be where the spell
-                            -- really stops, and the projectile stops on PHYSICS
-                            -- geometry, while the crosshair ray above is a
-                            -- RENDERING ray (it must be: it is what the player
-                            -- sees and what the engine uses to pick a Touch
-                            -- target). The two disagree whenever the visible
-                            -- surface is nearer than the collision surface —
-                            -- foliage, glass, banners and other non-collidable
-                            -- decoration, an actor's visual mesh in front of its
-                            -- capsule, or a dead actor the projectile flies
-                            -- through. Converging on the visual hit in those
-                            -- cases makes the spell land beside the crosshair,
-                            -- further off the further away the real target is.
-                            --
-                            -- Keep the rendering hit for target selection, and
-                            -- converge the launch direction on the first physics
-                            -- obstacle the projectile can actually collide with.
+                            -- ── Parallax convergence ──
+                            -- Converge on the first physics obstacle the projectile can hit; the rendering hit is only for target selection.
                             local convergePoint = aimPoint
                             do
                                 local from = cameraPos
@@ -3383,28 +3176,74 @@ processPendingLaunches = function()
                                 for _ = 1, 4 do
                                     local physRay = nearby.castRay(from, endPos, { ignore = self })
                                     if not (physRay.hit and physRay.hitPos) then break end
-                                    -- The projectile passes through dead actors;
-                                    -- their capsules must not converge the aim.
+                                    -- Projectiles pass through dead actors; don't converge on them.
                                     local o = physRay.hitObject
                                     local t = o and o.type
-                                    local isDeadActor = (t == types.NPC or t == types.Creature)
-                                        and types.Actor.isDead(o)
+                                    local isActor = t == types.NPC or t == types.Creature
+                                    local isDeadActor = isActor and types.Actor.isDead(o)
                                     if not isDeadActor then
-                                        convergePoint = physRay.hitPos
+                                        -- Vanilla parity: an actor is not a
+                                        -- surface to graze. When the crosshair
+                                        -- ray reaches a living actor, converge
+                                        -- on the CENTRE of its bounding box, so
+                                        -- a low crosshair (their legs, the
+                                        -- ground at their feet) still sends the
+                                        -- bolt through the middle of the body —
+                                        -- where the engine's own cast aims and
+                                        -- where the hit effect belongs.
+                                        convergePoint = (isActor
+                                            and require('scripts.ossc.ossc_cast_rules').actorAimPoint(o))
+                                            or physRay.hitPos
                                         break
                                     end
                                     from = physRay.hitPos + aimDir * 2
                                 end
                             end
                             local skewedDir      = (convergePoint - startPos):normalize()
+                            -- ── Moving-target lead (engine AimDirToMovingTarget clone) ──
+                            -- When the crosshair is on a living actor and the
+                            -- spell flies a bolt (Target-range effects), aim at
+                            -- the predicted intercept point instead of where
+                            -- the target stands now. The displacement is added
+                            -- to the already-converged aim point, so a
+                            -- stationary target (zero lead displacement) keeps
+                            -- the exact vanilla-crosshair trajectory, and the
+                            -- parallax convergence stays intact for moving
+                            -- ones. Applies to every quick-cast launch queued
+                            -- below regardless of the stance the cast started
+                            -- from — Weapon, Spell or relaxed.
+                            local launchDir = skewedDir
+                            if hasTargetEffects and hitObject and hitObject ~= self then
+                                local hitType = hitObject.type
+                                if (hitType == types.NPC or hitType == types.Creature)
+                                    and not types.Actor.isDead(hitObject) then
+                                    local led = leadLaunchDirection(spell, startPos, aimPoint, hitObject)
+                                    if led then
+                                        launchDir = led
+                                        debugLog("Moving-target lead applied: " .. tostring(hitObject.recordId))
+                                    end
+                                end
+                            end
                             if range == RANGE.Touch and hitObject then
-                                local fMaxActivateDist = GMST.iMaxActivateDist
-                                local maxDist = fMaxActivateDist + camera.getThirdPersonDistance() + 25
-                                local telekinesis = types.Actor.activeEffects(self)
-                                     :getEffect(core.magic.EFFECT_TYPE.Telekinesis)
-                                if telekinesis then maxDist = maxDist + telekinesis.magnitude*22 end
-                                local distFromEye = (aimPoint - cameraPos):length()
-                                if distFromEye > maxDist then hitObject = nil end
+                                -- Vanilla getFocusObject: an actor under the
+                                -- crosshair is a legal touch target inside
+                                -- iMaxActivateDist of the eye (telekinesis does
+                                -- not extend it for actors), and the touch
+                                -- reach/cone only applies to the getHitContact
+                                -- fallback above.
+                                --
+                                -- Measure to the TARGET, not to the crosshair
+                                -- ray end. When the ray missed — aiming over a
+                                -- shoulder, at a cliff racer against the sky, at
+                                -- a target whose mesh the physics ray slid past
+                                -- — aimPoint is the far end of the 10000-unit
+                                -- aim line, and that threw away exactly the
+                                -- getHitContact target the engine keeps.
+                                if not require('scripts.ossc.ossc_cast_rules').isCrosshairTouchTarget(
+                                    self, hitObject, cameraPos,
+                                    { camDist = camera.getThirdPersonDistance() }) then
+                                    hitObject = nil
+                                end
                             end
                             local spawnOffset = 80
                             local distFromStart = (aimPoint - startPos):length()
@@ -3413,11 +3252,7 @@ processPendingLaunches = function()
                                 spawnOffset = math.max(5, distFromStart - 10)
                             end
                             local kineticSpells = { kinetic_bolt = true, kinetic_expl = true }
-                            -- Friendlier Fire: never launch a harmful quick-cast at a
-                            -- follower/summon. Spell Framework Plus applies OSSC casts
-                            -- from Lua (ActiveSpells:add()), which bypasses FF's sweep,
-                            -- so OSSC must detect friendly fire before firing instead
-                            -- of relying on FF to clean up afterwards.
+                            -- Friendlier Fire: block harmful casts at followers/summons here; SFP's ActiveSpells:add() bypasses FF.
                             local friendlyFireBlocked = false
                             if hitObject and types.Actor.objectIsInstance(hitObject) then
                                 friendlyFireBlocked = friendlyFire.isFriendlyFireBlocked(self, hitObject, spell.effects)
@@ -3425,16 +3260,8 @@ processPendingLaunches = function()
                             if friendlyFireBlocked then
                                 debugLog("Cast vetoed — friendly fire: " .. tostring(spell.id) .. " -> " .. tostring(hitObject and hitObject.recordId or "nil"))
                             end
-                            -- ── Swimming fizzle (vanilla parity) ─────────────
-                            -- A target-range quick-cast released while the caster
-                            -- is swimming always fails, exactly like vanilla:
-                            -- the gesture plays, the magicka paid at animation
-                            -- start stays consumed, and the spell fizzles at the
-                            -- release moment with the vanilla failure sound —
-                            -- no projectile, no message, no skill XP, no power
-                            -- cooldown. Self- and Touch-range casts are
-                            -- unaffected, and merely WADING (feet in water)
-                            -- never counts as swimming.
+                            -- ── Swimming fizzle (vanilla parity) ──
+                            -- Target-range cast while swimming fizzles: magicka stays spent, no XP/cooldown. Wading doesn't count.
                             local swimmingFizzle = false
                             if Cfg.general and Cfg.general:get('BlockTargetSpellsWhileSwimming')
                                 and hasTargetRangeEffect(spell) and isSwimmingActor(self) then
@@ -3445,17 +3272,13 @@ processPendingLaunches = function()
 
                             local sentCastRequest = false
                             if swimmingFizzle then
-                                -- Vanilla parity: guaranteed fizzle — nothing
-                                -- launches, the paid magicka is not refunded.
+                                -- Guaranteed fizzle; paid magicka is not refunded.
                             elseif not friendlyFireBlocked and not kineticSpells[spell.id] then
-                                -- 'skill_based': the penalty follows the cast
-                                -- skill (0 → 50%, 100+ → none), Enchant for
-                                -- items; anything else is a flat percentage.
+                                -- 'skill_based': 50% at skill 0 to none at 100+ (Enchant for items); else flat %.
                                 local effectMode = Cfg.general and Cfg.general:get('QuickCastEffectPenalty')
                                 local effectScale
                                 if effectPenaltyExempt(spell) then
-                                    -- Powers are always full strength; so are
-                                    -- scrolls while the exclusion toggle is on.
+                                    -- Powers always full strength; scrolls too while excluded.
                                     effectScale = 1.0
                                 elseif Penalty.isSkillBased(effectMode) then
                                     local effectSchool = spell.item and 'enchant'
@@ -3465,16 +3288,8 @@ processPendingLaunches = function()
                                 else
                                     effectScale = getPenaltyScale(effectMode)
                                 end
-                                -- A spell's magicka was already paid at ANIMATION
-                                -- START (handleCastCosts — through the framework's
-                                -- consumeSpellCost when it is registered, from
-                                -- OSSC's own pocket otherwise), so the launch must
-                                -- be marked prepaid: isFree = true keeps Spell
-                                -- Framework Plus' launch-time resource guard from
-                                -- charging the release a second time. An enchanted
-                                -- item is the exception — its charge can only be
-                                -- written from a global script, so the deduction
-                                -- stays with SFP's guard at launch (isFree = false).
+                                -- Spell cost was paid at animation start, so isFree = true; enchanted items stay
+                                -- isFree = false (charge only writable from global, SFP's guard deducts).
                                 local isEnchantment = spell.item ~= nil
                                 debugLog(string.format("Sending CastRequest: spell=%s range=%d hitObject=%s attacker=%s",
                                     tostring(spell.id), range,
@@ -3487,73 +3302,120 @@ processPendingLaunches = function()
                                     if val ~= nil then showAll = val end
                                 end
 
-                                -- The source object must always be the caster
-                                -- itself, Self-range included: Spell Framework
-                                -- Plus' MagExp_CastRequest handler validates
-                                -- `type(data.attacker) == 'userdata'` and rejects
-                                -- the whole request when it is not an object
-                                -- (launchSpell requires an attacker too — the
-                                -- history comment about "self casts pass
-                                -- attacker == nil" described a contract that was
-                                -- never actually accepted).  A nil attacker for
-                                -- a Self-range quick cast therefore meant the
-                                -- spell silently never happened at all — no
-                                -- summon, no bound item, no heal — with every
-                                -- effect-penalty mechanic downstream (registry
-                                -- sweep, stat scaling, item swap) starved of its
-                                -- cast.  Every other sender in this repo (NPC
-                                -- quick-casts, item casts) already passes self.
+                                -- ── Impact area and pass-through ──
+                                -- `spell` is OSSC's own cast table (id, effects,
+                                -- cost, type) and carries no `area` field, so
+                                -- the old `area = spell.area` sent nothing at
+                                -- all and Spell Framework Plus silently derived
+                                -- the area from the record. Resolve it here,
+                                -- exactly as SFP would (the largest area among
+                                -- the bolt's own Target effects), so the launch
+                                -- says what it means.
+                                local castRules = require('scripts.ossc.ossc_cast_rules')
+                                local boltArea = castRules.impactArea(spellRec or spell)
+                                -- A living actor under the crosshair is the one
+                                -- the bolt is meant for: it must be able to
+                                -- show Spell Framework Plus' per-effect hit VFX
+                                -- (SFP sends an AddVfx event to the TARGET's
+                                -- local script, and only a global script may
+                                -- attach that handler — SFP itself only attaches
+                                -- it to the caster, which is why an actor's
+                                -- quick-cast at the Player looked right while
+                                -- the player's quick-cast at an actor showed
+                                -- nothing on impact).
+                                local castTarget = nil
+                                if hitObject
+                                    and (hitObject.type == types.NPC
+                                         or hitObject.type == types.Creature)
+                                    and not types.Actor.isDead(hitObject) then
+                                    castTarget = hitObject
+                                    core.sendGlobalEvent('OSSC_EnsureHitVfx', { actor = hitObject })
+                                end
+                                -- "Projectiles Pass Through Bystanders" (the NPC
+                                -- settings page, default on) applies to the
+                                -- player's own quick-casts as well: the bolt
+                                -- flies THROUGH actors that are not its target
+                                -- and those actors are not affected. The
+                                -- mechanism is the named mark (see
+                                -- castRules.requestBystanderPassThrough): SF+
+                                -- skips every actor that is not the actor the
+                                -- bolt was aimed at, so bystanders are simply
+                                -- not there for it. SF+'s
+                                -- `piercing` modifier is NOT used: it keeps the
+                                -- bolt flying by applying the spell to everybody
+                                -- it crosses (`MagExp_OnProjectilePierce` ->
+                                -- applySpellToActor), and nothing bounds it to
+                                -- stop at the intended target, so a bolt could be
+                                -- pierced straight through the enemy it was
+                                -- aimed at. A real area spell keeps the plain
+                                -- collision so its blast still detonates where it
+                                -- lands.
+                                local userData = { OSSC = true }
+                                local passThrough = not Cfg.npc
+                                    or Cfg.npc:get('NPCProjectilesPassThroughBystanders') ~= false
+                                if passThrough and boltArea <= 0 and range == RANGE.Target then
+                                    userData = castRules.requestBystanderPassThrough(
+                                        userData, self, castTarget)
+                                end
+                                -- Who draws the impact. A cast that EXPLODES
+                                -- anywhere is the engine's blast and stays SF+'s:
+                                -- `CastSpell::explodeSpell` spawns each exploding
+                                -- effect's own area static at the impact point, and
+                                -- SF+ mirrors that in `detonateSpellAtPos`. Taking
+                                -- such a cast over would suppress that spawn and
+                                -- replace it with a HIT static — a blast showing
+                                -- the wrong effect. Only a cast with no area
+                                -- anywhere gets OSSC's own hit statics.
+                                if range ~= RANGE.Self
+                                    and not castRules.explodes(spell) then
+                                    userData = impactVfx.requestFor(userData, spell)
+                                end
+
+                                -- attacker must always be self, Self range included: SFP rejects non-userdata attackers.
                                 core.sendGlobalEvent('MagExp_CastRequest', {
                                     attacker     = self,
                                     caster       = self,
                                     spellId      = spell.id,
                                     startPos     = startPos,
-                                    direction    = skewedDir,
-                                    area         = spell.area,
+                                    direction    = launchDir,
+                                    area         = boltArea,
                                     isFree       = not isEnchantment,
                                     item         = spell.item,
                                     itemRecordId = spell.item and spell.item.recordId or nil,
                                     hitObject    = hitObject,
-                                    -- Exact crosshair impact point. Spell Framework
-                                    -- Plus uses it to shorten the projectile spawn
-                                    -- offset at point-blank range, so a spell fired
-                                    -- at something right in front of the player can
-                                    -- no longer spawn past it.
-                                    hitPos       = (ray.hit and ray.hitPos) or nil,
+                                    -- Impact point. On a living actor it is the
+                                    -- centre of its bounding box (the same
+                                    -- point the bolt is aimed at); otherwise
+                                    -- the crosshair impact point, which SFP
+                                    -- also uses to shorten the point-blank
+                                    -- spawn offset.
+                                    hitPos       = ((hitObject
+                                        and (hitObject.type == types.NPC
+                                             or hitObject.type == types.Creature)
+                                        and not types.Actor.isDead(hitObject))
+                                        and castRules.actorAimPoint(hitObject))
+                                        or (ray.hit and ray.hitPos) or nil,
                                     spawnOffset  = spawnOffset,
                                     isGodMode    = debug.isGodMode(),
                                     effectScale  = effectScale,
                                     showAllCastVfx = showAll,
-                                    userData     = { OSSC = true },
+                                    userData     = userData,
                                 })
                                 sentCastRequest = true
                                 self:sendEvent('OSSC_OnSpellCast', { spellId = spell.id })
                             end
 
                             -- ── Skill Progression Backend ─────────────────────────────────────
-                            local xpGain = Cfg.general and Cfg.general:get('SkillExperience') or 0
                             local spMode = SkillModes.normalize(
                                 Cfg.general and Cfg.general:get('SkillProgressionMode'))
                             debugLog("[OSSC] SkillProgressionMode = " .. spMode)
 
                             -- ──────────────────────────────────────────────────────────────────
-                            -- MODE: ossc ── Direct stat mutation (legacy/vanilla).
-                            -- Uses the SkillExperience + ExperienceFormula settings.
+                            -- MODE: ossc — vanilla skill-use points and requirements.
                             -- No external mod events are fired.
                             -- ──────────────────────────────────────────────────────────────────
                             local function awardSkillXP_OSSC(skillId)
-                                local skill = types.NPC.stats.skills[skillId](self)
-                                if not skill or skill.base >= 100 then return end
-                                local gain = xpGain * 0.01
-                                if gain <= 0 then return end
-                                local prog = skill.progress + gain
-                                local base = skill.base
-                                while prog >= 1.00 and base < 100 do
-                                    base = base + 1
-                                    prog = prog - 1.00
-                                    levelUpSkill(skillId, base)
-                                end
-                                skill.progress = math.max(0, prog)
+                                awardSkillProgress(skillId)
                             end
 
                             -- ──────────────────────────────────────────────────────────────────
@@ -3567,7 +3429,13 @@ processPendingLaunches = function()
                             --                   via MagExp 'auto' formula mode — no manual toggle needed.
                             --   mbsp          → MBSP's addSkillUsedHandler computes cost-scaled XP.
                             -- ──────────────────────────────────────────────────────────────────
-                            local function awardSkillXP_External(skillId, isEnchant)
+                            -- skillId 'enchant' is exactly a CastWhenUsed
+                            -- ("Cast When Used") item use - see
+                            -- itemIncreasesEnchantSkill - so the use type
+                            -- keys off skillId alone. The external handler
+                            -- resolves its gain from the loaded skill record.
+                            local function awardSkillXP_External(skillId)
+                                local isEnchant = (skillId == 'enchant')
                                 if not (I.SkillProgression and I.SkillProgression.skillUsed) then
                                     debugLog("[OSSC] skillUsed unavailable, falling back to OSSC direct for " .. skillId)
                                     awardSkillXP_OSSC(skillId)
@@ -3578,59 +3446,11 @@ processPendingLaunches = function()
                                     or  I.SkillProgression.SKILL_USE_TYPES.Spellcast_Success
 
                                 local options = { useType = useType }
-                                if isEnchant then
-                                    local baseGain = 0.1
-                                    local rec = core.stats.Skill.record(skillId)
-                                    if rec and rec.skillGain and rec.skillGain[useType + 1] then
-                                        local recVal = rec.skillGain[useType + 1]
-                                        if math.abs(recVal - 0.123) > 0.001 then
-                                            baseGain = recVal
-                                        end
-                                    end
-                                    options.skillGain = baseGain
-                                end
-
                                 -- Delay by 200ms so the animation 'release' text key has time to fire first.
                                 async:newUnsavableSimulationTimer(0.2, function()
+                                    -- The external handler owns Enchant as well as
+                                    -- spell schools; adding it here awards twice.
                                     I.SkillProgression.skillUsed(skillId, options)
-
-                                    local isSkillEvo = SkillModes.isSkillEvolution(spMode)
-                                    if isEnchant and not isSkillEvo then
-                                        local skillStat = types.NPC.stats.skills[skillId](self)
-                                        if skillStat and skillStat.base < 100 then
-                                            local factor = core.getGMST("fMiscSkillBonus") or 1.25
-                                            local npcRec = types.NPC.record(self)
-                                            if npcRec and npcRec.class then
-                                                local cls = types.NPC.classes.record(npcRec.class)
-                                                if cls then
-                                                    local isMajor = false
-                                                    for _, s in ipairs(cls.majorSkills or {}) do
-                                                        if s == skillId then factor = core.getGMST("fMajorSkillBonus") or 0.75; isMajor = true; break end
-                                                    end
-                                                    if not isMajor then
-                                                        for _, s in ipairs(cls.minorSkills or {}) do
-                                                            if s == skillId then factor = core.getGMST("fMinorSkillBonus") or 1.0; break end
-                                                        end
-                                                    end
-                                                    local sRec = core.stats.Skill.record(skillId)
-                                                    if sRec and sRec.specialization == cls.specialization then
-                                                        factor = factor * (core.getGMST("fSpecialSkillBonus") or 0.8)
-                                                    end
-                                                end
-                                            end
-                                            local req = (skillStat.base + 1) * factor
-                                            if req <= 0 then req = 1 end
-
-                                            local prog = skillStat.progress + ((options.skillGain or 0.1) / req)
-                                            local base = skillStat.base
-                                            while prog >= 1.00 and base < 100 do
-                                                base = base + 1
-                                                prog = prog - 1.00
-                                                levelUpSkill(skillId, base)
-                                            end
-                                            skillStat.progress = math.max(0, prog)
-                                        end
-                                    end
                                 end)
                             end
 
@@ -3640,7 +3460,8 @@ processPendingLaunches = function()
                             -- We must patch that pointer to the current OSSC spell BEFORE calling
                             -- skillUsed, then restore it immediately afterwards.
                             -- ──────────────────────────────────────────────────────────────────
-                            local function awardSkillXP_SUS(skillId, isEnchant)
+                            local function awardSkillXP_SUS(skillId)
+                                local isEnchant = (skillId == 'enchant')
                                 if not (I.SkillProgression and I.SkillProgression.skillUsed) then
                                     debugLog("[OSSC] SUS: skillUsed unavailable, falling back to OSSC direct for " .. skillId)
                                     awardSkillXP_OSSC(skillId)
@@ -3651,18 +3472,6 @@ processPendingLaunches = function()
                                     or  I.SkillProgression.SKILL_USE_TYPES.Spellcast_Success
 
                                 local options = { useType = useType }
-                                if isEnchant then
-                                    local baseGain = 0.1
-                                    local rec = core.stats.Skill.record(skillId)
-                                    if rec and rec.skillGain and rec.skillGain[useType + 1] then
-                                        local recVal = rec.skillGain[useType + 1]
-                                        if math.abs(recVal - 0.123) > 0.001 then
-                                            baseGain = recVal
-                                        end
-                                    end
-                                    options.skillGain = baseGain
-                                end
-
                                 local spellForSus = spellRecs[spell.id]
                                 if not spellForSus and spell.effects and type(spell.cost) == "number" then
                                     spellForSus = spell
@@ -3690,49 +3499,10 @@ processPendingLaunches = function()
                                 async:newUnsavableSimulationTimer(0.2, function()
                                     I.SkillProgression.skillUsed(skillId, options)
                                     if capturedDtSus then capturedDtSus.pc.spell = capturedPrevSpell end
-
-                                    if isEnchant then
-                                        local skillStat = types.NPC.stats.skills[skillId](self)
-                                        if skillStat and skillStat.base < 100 then
-                                            local factor = core.getGMST("fMiscSkillBonus") or 1.25
-                                            local npcRec = types.NPC.record(self)
-                                            if npcRec and npcRec.class then
-                                                local cls = types.NPC.classes.record(npcRec.class)
-                                                if cls then
-                                                    local isMajor = false
-                                                    for _, s in ipairs(cls.majorSkills or {}) do
-                                                        if s == skillId then factor = core.getGMST("fMajorSkillBonus") or 0.75; isMajor = true; break end
-                                                    end
-                                                    if not isMajor then
-                                                        for _, s in ipairs(cls.minorSkills or {}) do
-                                                            if s == skillId then factor = core.getGMST("fMinorSkillBonus") or 1.0; break end
-                                                        end
-                                                    end
-                                                    local sRec = core.stats.Skill.record(skillId)
-                                                    if sRec and sRec.specialization == cls.specialization then
-                                                        factor = factor * (core.getGMST("fSpecialSkillBonus") or 0.8)
-                                                    end
-                                                end
-                                            end
-                                            local req = (skillStat.base + 1) * factor
-                                            if req <= 0 then req = 1 end
-
-                                            local prog = skillStat.progress + ((options.skillGain or 0.1) / req)
-                                            local base = skillStat.base
-                                            while prog >= 1.00 and base < 100 do
-                                                base = base + 1
-                                                prog = prog - 1.00
-                                                levelUpSkill(skillId, base)
-                                            end
-                                            skillStat.progress = math.max(0, prog)
-                                        end
-                                    end
                                 end)
                             end
 
-                            -- ──────────────────────────────────────────────────────────────────
-                            -- Top-level dispatcher
-                            -- ──────────────────────────────────────────────────────────────────
+                            -- ── Top-level dispatcher ──
                             local function awardSkillXP_Incantation()
                                 local isIncInstalled = types.NPC.stats.skills['incantation_skill'] ~= nil
                                     and types.NPC.stats.skills['incantation_skill'](self) ~= nil
@@ -3772,9 +3542,8 @@ processPendingLaunches = function()
                                 end
                             end
 
-                            local function awardSkillXP(skillId, isEnchant)
+                            local function awardSkillXP(skillId)
                                 debugLog("[OSSC] awardSkillXP: id=" .. skillId
-                                    .. " enchant=" .. tostring(isEnchant)
                                     .. " mode=" .. spMode)
                                     
                                 -- 'none' leaves spellcasting progression entirely
@@ -3782,13 +3551,15 @@ processPendingLaunches = function()
                                 -- the Incantation award included.  That mod still
                                 -- needs to hear that a cast happened, or it has
                                 -- nothing to call I.OSSC.awardSkillProgress for.
+                                -- skillId alone identifies the use: 'enchant'
+                                -- is exactly a CastWhenUsed item use, anything
+                                -- else names the spell school skill.
                                 if SkillModes.isDisabled(spMode) then
                                     core.sendGlobalEvent('OSSC_SkillProgressSkipped', {
                                         actor     = self,
                                         skillId   = skillId,
                                         spellId   = spell and spell.id,
                                         cost      = (spell and spell.cost) or 0,
-                                        isEnchant = isEnchant == true,
                                     })
                                     return
                                 end
@@ -3798,9 +3569,9 @@ processPendingLaunches = function()
                                 if spMode == 'ossc' then
                                     awardSkillXP_OSSC(skillId)
                                 elseif SkillModes.isExternal(spMode) then
-                                    awardSkillXP_External(skillId, isEnchant)
+                                    awardSkillXP_External(skillId)
                                 elseif spMode == 'sus' then
-                                    awardSkillXP_SUS(skillId, isEnchant)
+                                    awardSkillXP_SUS(skillId)
                                 else
                                     debugLog("[OSSC] Unknown mode '" .. tostring(spMode) .. "', using OSSC direct.")
                                     awardSkillXP_OSSC(skillId)
@@ -3820,12 +3591,23 @@ processPendingLaunches = function()
                                     return school or getDominantSkillSchool(spell)
                                 end
 
+                                -- Vanilla raises a skill only for skill
+                                -- increasing casts: Spellcast_Success for a
+                                -- plain spell without "Always Succeeds"
+                                -- (spellIncreasesSkill), Enchant - "Cast When
+                                -- Used" - for a CastOnUse item
+                                -- (itemIncreasesEnchantSkill).  Abilities,
+                                -- Powers, always-succeed spells and scrolls
+                                -- raise nothing, so they are fully silent
+                                -- here: no award, no announcement, no refund.
                                 if isItem then
-                                    awardSkillXP('enchant', true)
-                                else
+                                    if itemIncreasesEnchantSkill(spell) then
+                                        awardSkillXP('enchant')
+                                    end
+                                elseif spellIncreasesSkill(spell) then
                                     local school = resolveMagicSchool()
                                     if school and MAGIC_SKILLS[school] then
-                                        awardSkillXP(school, false)
+                                        awardSkillXP(school)
                                         -- MBSP Magicka Refund (1:1 clone): a
                                         -- successful magic-school spell cast
                                         -- returns part of the magicka cost.
@@ -3850,11 +3632,7 @@ processPendingLaunches = function()
             if pl.castId == Cast.currentCastId then
                 launchCleanup("launch resolved")
             end
-            -- A previous cast's late launch: its state was already unlocked at
-            -- its own 'stop' key, and the VFX it left behind share this cast's
-            -- vfx ids — the current cast's own launchCleanup/fullCleanup sweeps
-            -- them. Touch nothing here, or a cast mid-wind-up loses its spell
-            -- state and never launches.
+            -- Previous cast's late launch: touch nothing, or the current cast loses its state.
             break
         end
     end
@@ -3867,38 +3645,22 @@ local function onTextKey(groupname, key)
     local lowerKey = tostring(key):lower()
     debugLog("TextKey ["..groupname.."] '"..lowerKey.."'")
     if lowerKey == 'start' or lowerKey == 'equip start' then
-        -- ── One cast start per cast (vanilla audio behaviour) ─────────────
-        -- The cast sound / cast VFX / safety-launch timer belong to the very
-        -- beginning of a cast and must fire exactly once per quickcast.
-        -- `hasQueuedLaunch` alone is not enough of a latch: launchCleanup()
-        -- clears it the moment the spell is released, so any further 'start'
-        -- (or 'equip start') text key that reaches this handler afterwards —
-        -- a re-played / re-blended cast animation, an animation that loops
-        -- back, or a second animation instance of the same group — re-entered
-        -- this branch and played the school cast sound A SECOND TIME, right
-        -- at the release. Vanilla plays the cast sound only at cast start;
-        -- the release has its own (different) sound. Latch on the cast id and
-        -- on hasFiredThisCast so a post-release 'start' can never replay it.
+        -- ── One cast start per cast (vanilla audio) ──
+        -- Latch on cast id + hasFiredThisCast; hasQueuedLaunch clears at release, so a replayed 'start' would replay the sound.
         if Cast.hasFiredThisCast then return end
         if Cast.startKeyCastId == Cast.currentCastId then return end
         if Cast.hasQueuedLaunch then return end
         Cast.startKeyCastId  = Cast.currentCastId
         Cast.hasQueuedLaunch = true
 
-        -- Resource payment is a one-shot transaction for the active cast.
-        -- Keep this separate from the animation-start/audio latch so a rapid
-        -- re-entry or duplicate start callback cannot debit Magicka/fatigue
-        -- twice for the same cast transaction.
+        -- Payment latched separately per cast id so a duplicate start can't double-debit.
         if Cast.costPaidCastId ~= Cast.currentCastId then
             local paid, costMessage = handleCastCosts(Cast.currentSpell)
             Cast.currentIsPaid      = paid
             Cast.currentCostMessage = costMessage
             Cast.costPaidCastId     = Cast.currentCastId
         end
-        -- A refused cast has to say why. handleCastCosts only fills in a
-        -- message when OSSC was the one that refused; when a casting framework
-        -- owns the pool it shows its own toast and returns nil, so the guard
-        -- on currentCostMessage is what stops the player getting two.
+        -- Only OSSC's own refusal sets a message; frameworks show their own toast.
         if not Cast.currentIsPaid and Cast.currentCostMessage then
             ui.showMessage(Cast.currentCostMessage)
         end
@@ -3929,25 +3691,14 @@ local function onTextKey(groupname, key)
                 { timeOffset=0.6, volume=snapVol, loop=false })
         end
 
-        -- PMM multi mark window: with after-cast behavior the full cast
-        -- animation plays first. The window is opened on the 'release' text
-        -- key (with a 'stop' key / safety-timer fallback, see below) instead
-        -- of here at cast start.
+        -- PMM after-cast: window opens on 'release' ('stop' / safety fallback), not here.
 
         local safetySpell  = Cast.currentSpell
         local safetyCastId = Cast.currentCastId
-        -- Snapshotted with the spell, like castId: the safety launch queue
-        -- entry must carry the payment verdict of THIS cast. Reading
-        -- Cast.currentIsPaid when the timer fires instead would let a later
-        -- cast's (or the default's) value leak into this launch, and dropping
-        -- the field entirely made every safety-timer launch read as unpaid —
-        -- which failed every cast that resolves through this fallback with
-        -- "not enough magicka" (most animation groups never emit a 'release'
-        -- text key before the timer runs out).
+        -- Snapshot this cast's payment verdict; reading it at timer time leaks another cast's value.
         local safetyPaid   = Cast.currentIsPaid
         local safetyTimerDuration = 0.96 / Cast.currentFinalSpeed
-        -- Re-arm while the PMM recall UI is open: a one-shot timer that
-        -- expires during the selection dialog would leave the cast stranded.
+        -- Re-arm while the PMM UI is open, or the cast is stranded.
         local safetyLaunchTick
         safetyLaunchTick = function()
             if not Cast.isCasting then return end
@@ -3959,10 +3710,7 @@ local function onTextKey(groupname, key)
                 return
             end
             if PMM.pmmDeferredRecall then
-                -- After-cast PMM recall: the launch is queued when the PMM
-                -- window resolves (the window opens on the 'release' key,
-                -- or via the 'stop' key / safety fallback), so there is
-                -- nothing to do here.
+                -- After-cast PMM: the launch is queued when the window resolves.
                 return
             end
             debugLog("Safety launch timer fired for group '" .. groupname .. "' (no 'release' key) duration="..safetyTimerDuration)
@@ -3990,21 +3738,11 @@ local function onTextKey(groupname, key)
         end
         if Cast.hasFiredThisCast then return end
         if PMM.pmmDeferredRecall then
-            -- After-cast PMM window: the casting just happened at the
-            -- 'release' key, so this is the moment to open the multi mark
-            -- window. Waiting for the 'stop' key is not reliable — some
-            -- animation groups (e.g. qcsnap) carry no 'stop' text key. The
-            -- recall launch stays held until the player picks a mark.
+            -- Open the PMM window at 'release' (some groups, e.g. qcsnap, lack 'stop'); launch held until a pick.
             debugLog("'release' — opening PMM multi mark window after the cast")
             openPMMRecallWindow()
             if not PMM.isWaitingForPMMInput then
-                -- The window could not be opened (module failed to load) —
-                -- openPMMRecallWindow resets isWaitingForPMMInput on failure.
-                -- With Pure Multi Mark Compatibility enabled the vanilla
-                -- mark must not go through — cancel the recall instead of
-                -- falling back to a standard Recall. (pmmDeferredRecall
-                -- stays true until the recall resolves, so checking it here
-                -- would also destroy a successfully opened window.)
+                -- Open failed: cancel, no vanilla Recall fallback. Don't test pmmDeferredRecall here (true while a window is open).
                 PMM.pmmSelectedDestination = nil
                 PMM.pmmVanillaRecall = false
                 fullCleanup('PMM window unavailable — recall cancelled')
@@ -4016,8 +3754,7 @@ local function onTextKey(groupname, key)
         Cast.hasFiredThisCast = true
         debugLog("'release' — queuing launch castId="..Cast.currentCastId)
         if isStaggeredOrKnocked() then
-            -- Staggered/knocked at the release moment: cancel the cast the
-            -- way vanilla does instead of launching the spell.
+            -- Staggered/knocked at release: cancel like vanilla.
             debugLog("'release' cancelled — staggered or knocked mid-cast")
             fullCleanup("staggered/knocked mid-cast (release key)")
             return
@@ -4034,22 +3771,17 @@ local function onTextKey(groupname, key)
     elseif lowerKey == 'stop' then
         debugLog("'stop' key — unlocking castId="..Cast.currentCastId)
         if PMM.pmmDeferredRecall and not PMM.isWaitingForPMMInput then
-            -- Fallback for animation groups that emit 'stop' but no
-            -- 'release' key: the casting is over, so open the multi mark
-            -- window here.
+            -- Fallback for groups with 'stop' but no 'release'.
             debugLog('[OSSC] Cast complete — opening PMM Recall UI window')
             openPMMRecallWindow()
         end
         if PMM.pmmDeferredRecall and PMM.isWaitingForPMMInput then
-            -- The window is up: keep the cast locked (and the combat block
-            -- active) until the player picks a mark or closes the window.
+            -- Hold the cast lock until the window resolves.
             debugLog('[OSSC] PMM window open — holding cast lock until it resolves')
             return
         end
         if PMM.pmmDeferredRecall then
-            -- The window could not be opened (module failed to load). With
-            -- Pure Multi Mark Compatibility enabled the vanilla mark must
-            -- not go through — cancel the recall instead of casting it.
+            -- Open failed: cancel the recall (no vanilla mark under PMM compat).
             PMM.pmmSelectedDestination = nil
             PMM.pmmVanillaRecall = false
             fullCleanup('PMM window unavailable — recall cancelled')
@@ -4121,12 +3853,12 @@ local lastSpellHotkeySlot     = nil
 -- swap the hotbar row and OSSC re-cast the weapon (nothing had changed, so
 -- the press looked exactly like a re-cast). These fields let OSSC tell the
 -- two apart:
---   pendingQuickkeyPageSwitch — the press carried the row-switch modifier
---   pendingQuickkeyEquipment  — equipment snapshot taken at press time, so a
---                               slot that equips something is never a re-cast
---   hotbarSlotOverride(+Time) — the real (row*10+n) slot a hotbar mod says
---                               this press activated; nil = nothing at all
---   hotbarMagicActivation     — { slot, time } when a hotbar mod reports the
+--   QuickkeyPress.pendingPageSwitch — the press carried the row-switch modifier
+--   QuickkeyPress.pendingEquipment  — equipment snapshot taken at press time, so
+--                               a slot that equips something is never a re-cast
+--   QuickkeyPress.hotbarSlotOverride(+Time) — the real (row*10+n) slot a hotbar
+--                               mod says this press activated; nil = nothing at all
+--   Cast.hotbarMagicActivation — { slot, time } when a hotbar mod reports the
 --                               press activated a SPELL / ENCHANTED-ITEM tile,
 --                               even one whose magic was already selected (a
 --                               reselect changes nothing observable — no new
@@ -4135,32 +3867,26 @@ local lastSpellHotkeySlot     = nil
 --                               indistinguishable from an empty slot and a
 --                               fresh load, with no recast markers set yet,
 --                               wrongly refuses to cast it)
---   quickkeyVetoUntil         — a hotbar mod consumed the press for something
+--   QuickkeyPress.vetoUntil    — a hotbar mod consumed the press for something
 --                               that is not a cast (works regardless of which
 --                               mod's input handler the engine runs first)
-local pendingQuickkeyPageSwitch = false
-local pendingQuickkeyEquipment  = nil
-local pendingQuickkeyPressTime  = 0
-local hotbarSlotOverride        = nil
-local hotbarSlotOverrideTime    = 0
-local hotbarMagicActivation     = nil
-local quickkeyVetoUntil         = 0
-local QUICKKEY_VETO_WINDOW      = 0.15
-local HOTBAR_SLOT_MATCH_WINDOW  = 0.5
+QuickkeyPress.pendingPageSwitch       = false
+QuickkeyPress.pendingEquipment        = nil
+QuickkeyPress.pendingPressTime        = 0
+QuickkeyPress.hotbarSlotOverride      = nil
+QuickkeyPress.hotbarSlotOverrideTime  = 0
+QuickkeyPress.vetoUntil               = 0
+QuickkeyPress.vetoWindow              = 0.15
+QuickkeyPress.hotbarSlotMatchWindow   = 0.5
+Cast.hotbarMagicActivation            = nil
 
 -- Wall clock for hotkey timing
 local function realTimeNow()
     return core.getRealTime()
 end
 
--- ── Row-switch modifier detection ────────────────────────────────────────
--- Mirrors QuickSelect Ultimate's own rule (SettingsQuickSelectKeyboard /
--- barSelectionMode + hotbarCount, see QuickSelect_p.lua) so a row switch is
--- never mistaken for a cast request. When no paged hotbar mod is installed
--- the check falls back to "any modifier is held": vanilla quick keys have no
--- modifier meaning either, and the result only gates the ambiguous
--- "nothing changed" re-cast below — a real activation (selection change or
--- Spell stance raised) still casts.
+-- ── Row-switch modifier detection ──
+-- Mirrors QuickSelect Ultimate's rule, else any modifier counts. Only gates the no-change re-cast.
 local function hotbarRowSwitchPressed(slotIndex)
     local heldShift = (input.isShiftPressed and input.isShiftPressed() == true) or false
     local heldCtrl  = (input.isCtrlPressed  and input.isCtrlPressed()  == true) or false
@@ -4176,8 +3902,7 @@ local function hotbarRowSwitchPressed(slotIndex)
     end
     maxBars = maxBars or 3
 
-    -- Row switching only uses keys 1..hotbarCount; the other keys always
-    -- activate a slot on the visible row.
+    -- Only keys 1..hotbarCount switch rows.
     if slotIndex < 1 or slotIndex > maxBars then return false end
     if mode == 'Ctrl Modifier'  then return heldCtrl  end
     if mode == 'Alt Modifier'   then return heldAlt   end
@@ -4185,12 +3910,8 @@ local function hotbarRowSwitchPressed(slotIndex)
     return false
 end
 
--- ── Equipment snapshot ───────────────────────────────────────────────────
--- A hotbar slot that equips something (weapon / armour / potion / …) is not a
--- request to re-cast whatever magic happens to stay selected. Comparing the
--- equipment at press time and at resolve time catches exactly that — including
--- another row's slot 1 that holds a plain item while the previous row's slot 1
--- held the enchanted weapon.
+-- ── Equipment snapshot ──
+-- A slot that equips something is never a re-cast.
 local function snapshotEquipmentIds()
     local equipment = types.Actor.equipment(self)
     if not equipment then return nil end
@@ -4223,20 +3944,8 @@ local function equipmentChangedSince(snapshot)
     return false
 end
 
--- ── Previous-frame baseline for quickkey change detection ─────────────────
--- The engine's ActionManager::executeAction runs the NATIVE quickkey first
--- (selection + setDrawState(Spell)) and only afterwards queues the Lua input
--- callbacks — so by the time handleQuickkeyPress runs, getSelectedSpell /
--- getSelectedEnchantedItem / getStance / equipment already describe the
--- POST-press state. Change detection against a snapshot taken in the handler
--- can therefore never fire for an immediate quickkey (previous == current by
--- construction, and the stance at handler time is always already Spell).
--- Capture the baseline at the END of every onFrame instead — after
--- suppression has reverted any automatic stance — so the handler always
--- compares against the true pre-press state. Called at every onFrame exit
--- (all early returns included, and even when the quickkeys/stance settings
--- are off, so a later re-enable starts from a fresh baseline rather than a
--- stale one).
+-- ── Previous-frame baseline for quickkey change detection ──
+-- The native quickkey runs before Lua input callbacks; capture the pre-press baseline at every onFrame exit.
 local function updatePrevFrameStore()
     Stance.prevFrameSpell = nil
     Stance.prevFrameItem  = nil
@@ -4255,15 +3964,13 @@ local function updatePrevFrameStore()
     Stance.prevFrameEquipment = snapshotEquipmentIds()
     local equipment = types.Actor.equipment(self)
     Stance.prevFrameWeapon = equipment and equipment[SLOT.CarriedRight] or nil
-    -- Attacks already in flight before a quick-key press. The sheathe the
-    -- engine starts for the press is not in this snapshot: mechanics runs
-    -- before this store is refreshed, and the press handler copies it first.
+    -- Attacks in flight before the press (the press's own sheathe is not included).
     local playing = {}
     local function notePlaying(group)
         if anim.isPlaying(self, group) then playing[group] = true end
     end
-    for _, g in ipairs(COMBAT_ANIM_GROUPS) do notePlaying(g) end
-    for _, g in ipairs(LIGHT_ATTACK_GROUPS) do notePlaying(g) end
+    for _, g in ipairs(Anim.COMBAT_ANIM_GROUPS) do notePlaying(g) end
+    for _, g in ipairs(Anim.LIGHT_ATTACK_GROUPS) do notePlaying(g) end
     Stance.prevCombatAnims = playing
 end
 
@@ -4289,7 +3996,7 @@ local function handleQuickkeyPress(slotIndex)
 
     -- A paged hotbar mod already told us it consumed this very key press for
     -- something that is not a cast (row switch, navigation, empty slot).
-    if realTimeNow() < quickkeyVetoUntil then
+    if realTimeNow() < QuickkeyPress.vetoUntil then
         debugLog("[OSSC Hotkey] QuickKey slot " .. tostring(slotIndex)
             .. " ignored — consumed by a hotbar mod.")
         return
@@ -4325,8 +4032,8 @@ local function handleQuickkeyPress(slotIndex)
     -- The pre-press baseline captured at the end of the previous onFrame.
     -- (The equipment table is replaced — never mutated — by every store
     -- refresh, so sharing the reference with the pending press is safe.)
-    quickkeyPreviousSpellRecordId = Stance.prevFrameSpell
-    quickkeyPreviousItemRecordId  = Stance.prevFrameItem
+    QuickkeyPress.prevSpellRecordId = Stance.prevFrameSpell
+    QuickkeyPress.prevItemRecordId  = Stance.prevFrameItem
 
     QuickkeyPress.slot                  = slotIndex
     QuickkeyPress.timer                 = onCooldown and 0.05 or 0.25
@@ -4334,21 +4041,13 @@ local function handleQuickkeyPress(slotIndex)
     QuickkeyPress.prePressStance        = Stance.prevFrameStance
     QuickkeyPress.sawSpellStance        = false
     QuickkeyPress.blockedByCooldown    = onCooldown
-    -- A press that turns out not to cast must not inherit a restore target left
-    -- over from an earlier cast that never reached animUnlock. A press that
-    -- arrives while a quickkey cast IS in flight (spamming the key) must not
-    -- steal that cast's target either: animUnlock is the only place that puts
-    -- the pre-press stance back, so clearing it here left the player in the
-    -- engine's Spell stance for good — the reported "spamming the quickkey
-    -- still leaves me in spell stance". The stale-target cleanup therefore
-    -- only runs when no cast is in flight, and an in-flight cast keeps its
-    -- target for animUnlock (Stance.quickkeyWindowActive uses the same test).
+    -- Clear a stale restore target only when no cast is in flight; animUnlock needs it.
     if not Cast.isCasting then
         Stance.postCastRestore          = nil
     end
-    pendingQuickkeyPressTime            = realTimeNow()
-    pendingQuickkeyEquipment            = Stance.prevFrameEquipment
-    pendingQuickkeyPageSwitch           = hotbarRowSwitchPressed(slotIndex)
+    QuickkeyPress.pendingPressTime            = realTimeNow()
+    QuickkeyPress.pendingEquipment            = Stance.prevFrameEquipment
+    QuickkeyPress.pendingPageSwitch           = hotbarRowSwitchPressed(slotIndex)
     Stance.noteCombatAnimsAtPress()
     -- A repeat press (spam) starts a new sheathe. Allow the one-shot cancel
     -- to run again for groups that were not already an attack.
@@ -4366,11 +4065,11 @@ local function handleQuickkeyPress(slotIndex)
 
     debugLog("[OSSC Hotkey] QuickKey PRESS accepted: slot="
         .. tostring(slotIndex)
-        .. " prevSpell=" .. tostring(quickkeyPreviousSpellRecordId)
-        .. " prevMagicItem=" .. tostring(quickkeyPreviousItemRecordId)
+        .. " prevSpell=" .. tostring(QuickkeyPress.prevSpellRecordId)
+        .. " prevMagicItem=" .. tostring(QuickkeyPress.prevItemRecordId)
         .. " startedInSpellStance="
         .. tostring(QuickkeyPress.startedInSpellStance)
-        .. " rowSwitchModifier=" .. tostring(pendingQuickkeyPageSwitch)
+        .. " rowSwitchModifier=" .. tostring(QuickkeyPress.pendingPageSwitch)
         .. " cooldownBlocked=" .. tostring(onCooldown))
 end
 
@@ -4413,37 +4112,13 @@ if I.AnimationController then
         I.AnimationController.addTextKeyHandler(g, onIncapacitationTextKey)
     end
 
-    -- Mid-cast heavy-weapon attack cancellation (BlockWeaponDuringQuickcast):
-    -- if the player starts a 2H / bow / crossbow attack while the cast
-    -- animation has the hands busy, cancel it so the attack never plays over
-    -- the cast. This is the smooth backup to the Fighting control switch and
-    -- also covers a 1-tap attack that gets through the switch.
-    -- One-handed / hand-to-hand / thrown groups are intentionally never
-    -- cancelled here — they must play (and finish) through a quickcast.
+    -- Mid-cast heavy attack cancel (2H/bow/crossbow); 1H/H2H/thrown must never be cancelled.
     if I.AnimationController.addPlayBlendedAnimationHandler then
         I.AnimationController.addPlayBlendedAnimationHandler(function(groupname, options)
             if type(groupname) ~= 'string' then return end
-            -- ── Native spell-stance VFX suppression (pre-play veto) ──────────
-            -- Veto the engine's 'spell' / 'spellcast' equip animation when the
-            -- player is NOT in an OSSC quickcast. This prevents the engine from
-            -- spawning cast VFX on the hands when just readying spell stance.
-            -- OSSC casts use their own animation groups, so this never affects
-            -- an actual quickcast.
-            --
-            -- Inside an OSSC quickcast the veto stays on for the QUICKKEY
-            -- window: the engine re-applies a spammed quickkey while the cast
-            -- it started is still running, and the native equip animation that
-            -- comes with that re-raise is the whole-actor twitch on every spam
-            -- press — the re-initiation the dedicated quick-cast button never
-            -- shows, because that key touches no engine draw state. A manual
-            -- spell stance (R) keeps its vanilla equip animation.
-            --
-            -- Scoped to SuppressSpellStance: with the setting OFF, hotkeys and
-            -- the ready-magic key must raise the spell stance EXACTLY like
-            -- vanilla — the equip animation is what visibly brings the hands
-            -- up, and skipping it made quickkey stance raises look like
-            -- nothing happened. The blockade owns quickkey stances only while
-            -- the setting is on.
+            -- ── Native spell-stance VFX suppression (pre-play veto) ──
+            -- Veto native 'spell'/'spellcast' equip outside OSSC casts and in the quickkey window.
+            -- Only with SuppressSpellStance on; off must match vanilla.
             if Cfg.general and Cfg.general:get('SuppressSpellStance') == true
                 and (groupname == 'spell' or groupname == 'spellcast')
                 and (not Cast.isCasting
@@ -4458,27 +4133,44 @@ if I.AnimationController then
                     return
                 end
             end
-            -- ── Native weapon draw / sheathe requests in the window ─────────
-            -- Reverting the quick-key's Spell raise makes the engine draw the
-            -- weapon again: showWeapons(false), then a play from 'equip start'
-            -- to 'equip stop', and the mesh comes back only at 'equip attach'
-            -- (or from the engine's own showWeapons(true) when the set has no
-            -- such key). Leaving that play untouched — the previous fix, so
-            -- the mesh would not stay hidden — is the visible re-equip. The
-            -- draw is therefore collapsed onto the attach key (see
-            -- Stance.collapseEquipPlay) and returned before any later rule can
-            -- cancel it. It is never skipped: a skipped draw never fires the
-            -- attach key, and the weapon stays gone.
-            --
-            -- The sheathe is still dropped. Dropping it cannot hide the mesh
-            -- (nothing runs its 'unequip detach' key), and a sheathe that is
-            -- already playing is cancelled once from onUpdate before that key.
+            -- ── A ready / unready must not take the casting hand ──────────
+            -- The engine plays a weapon ready / unready as one All-bones
+            -- blended play of the weapon's group (`equip start` →
+            -- `equip stop`, `unequip start` → `unequip detach`). Its mask
+            -- includes LeftArm, so toggling readiness while a quick-cast is in
+            -- flight froze the gesture mid-cast — the reported "unequipping /
+            -- equipping the weapon cancels my quickcast". The cast is never
+            -- cancelled by a stance change: the transition simply plays
+            -- WITHOUT the casting arm, and it keeps its own attach keys, so
+            -- the weapon still comes out / gets sheathed normally.
+            if Cast.isCasting and type(options) == 'table'
+                and (isWeaponReadyGroup(groupname) or groupname == 'shield') then
+                local startKey = tostring(options.startKey or options.startkey or ''):lower()
+                local stopKey  = tostring(options.stopKey  or options.stopkey  or ''):lower()
+                local transition = startKey:find('equip', 1, true)
+                    or stopKey:find('equip', 1, true)
+                if transition then
+                    local mask = options.blendMask
+                    if type(mask) == 'table' then
+                        if mask[anim.BONE_GROUP.LeftArm] ~= nil then
+                            mask[anim.BONE_GROUP.LeftArm] = PRIO.Default
+                        end
+                    elseif type(mask) == 'number'
+                        and mask % (2 * BMASK.LeftArm) >= BMASK.LeftArm then
+                        options.blendMask = mask - BMASK.LeftArm
+                    end
+                    debugLog("[OSSC Stance] Ready/unready keeps the quick-cast's "
+                        .. "casting hand: " .. groupname)
+                end
+            end
+
+            -- ── Native weapon draw / sheathe requests in the window ──
+            -- Collapse the draw onto its attach key, never skip it (the weapon would stay gone). Drop the sheathe.
             if Stance.nativeQuickkeySuppression
                 and Cfg.general and Cfg.general:get('SuppressSpellStance') == true
                 and (isWeaponReadyGroup(groupname) or groupname == 'shield')
                 and type(options) == 'table' then
-                -- The engine passes the keys as startKey/stopKey; Lua callers
-                -- may use the lowercase spelling.
+                -- Engine passes startKey/stopKey; Lua callers may use lowercase.
                 local startKey = tostring(options.startKey or options.startkey or ''):lower()
                 local stopKey  = tostring(options.stopKey or options.stopkey or ''):lower()
                 if startKey == 'equip start' or stopKey == 'equip stop' then
@@ -4494,12 +4186,12 @@ if I.AnimationController then
 
             -- Hard allow-list: never touch light attack groups, even if a
             -- future change broadens shouldBlockHeavyAttack.
-            for _, g in ipairs(LIGHT_ATTACK_GROUPS) do
+            for _, g in ipairs(Anim.LIGHT_ATTACK_GROUPS) do
                 if groupname == g then return end
             end
             -- Heavy attack cancel: 2H/bow/crossbow attacks blocked mid-cast.
             if shouldBlockHeavyAttack() then
-                for _, g in ipairs(HEAVY_ATTACK_GROUPS) do
+                for _, g in ipairs(Anim.HEAVY_ATTACK_GROUPS) do
                     if groupname == g then
                         -- Only cancel actual attacks, NOT weapon equip/draw/holster animations.
                         -- Equip/draw animations use stopkey "equip stop"; attack animations use "stop".
@@ -4509,12 +4201,16 @@ if I.AnimationController then
                         -- lowercase spelling never matched an engine play, so this guard never
                         -- fired and real draws were cancelled. Same rule as ossc_npc.lua
                         -- isEquipPlay.
-                        local sk = type(options) == 'table'
-                                   and tostring(options.stopKey or options.stopkey or ''):lower() or ''
-                        if sk:find('equip', 1, true) then
+                        local castRulesNow = require('scripts.ossc.ossc_cast_rules')
+                        if castRulesNow.isEquipPlay(options) then
+                            -- Remember it: the per-frame cancel below must not
+                            -- touch it either, or the mesh is dropped anyway
+                            -- one frame later.
+                            castRulesNow.noteDraw(Stance.drawTracker, g)
                             debugLog("Allowed " .. g .. " equip/draw animation during quickcast (not an attack)")
                             return
                         end
+                        castRulesNow.clearDraw(Stance.drawTracker, g)
                         debugLog("Cancelled " .. g .. " attack during quickcast")
                         anim.cancel(self, g)
                         return
@@ -4529,9 +4225,7 @@ if I.AnimationController then
         end)
     end
 
-    -- ── Hit / Death animation abort ────────────────────────────────────────
-    -- If the caster takes a hit or dies while quickcasting, abort the cast
-    -- immediately so the hit / death animation is not fighting the cast anim.
+    -- ── Hit / Death animation abort ──
     local function onHitDeathTextKey(groupname, key)
         if not Cast.isCasting then return end
         local lowerKey = tostring(key):lower()
@@ -4545,6 +4239,25 @@ if I.AnimationController then
         end
     end
 
+    -- ── Weapon draw (equip) tracking ──
+    -- 'equip start' / 'equip attach' on a weapon group mean the engine is
+    -- drawing it (it attaches the mesh on the attach key), 'equip stop' /
+    -- 'unequip detach' end the transition. Record it so no OSSC cancel path
+    -- can take the weapon out of the player's hands while it is invisible.
+    local function trackWeaponDraw(groupname, key)
+        local k = tostring(key):lower()
+        if not k:find('equip', 1, true) then return end
+        local castRulesNow = require('scripts.ossc.ossc_cast_rules')
+        if k:find('start', 1, true) or k:find('attach', 1, true) then
+            castRulesNow.noteDraw(Stance.drawTracker, groupname)
+        elseif k:find('stop', 1, true) or k:find('detach', 1, true) then
+            castRulesNow.clearDraw(Stance.drawTracker, groupname)
+        end
+    end
+    for _, g in ipairs(Anim.HEAVY_ATTACK_GROUPS) do
+        I.AnimationController.addTextKeyHandler(g, trackWeaponDraw)
+    end
+
     local hitDeathGroups = {
         'hit1','hit2','hit3','hit4','hit5',
         'death1','death2','death3','death4','death5',
@@ -4556,22 +4269,10 @@ if I.AnimationController then
 
     I.AnimationController.addTextKeyHandler('egidle2', onegidle2TextKey)
 
-    -- ── Native Spell Stance VFX Suppression ────────────────────────────────
-    -- When entering spell stance natively (e.g. via ready weapon key or hotbar)
-    -- without SpeedyMagick, the engine plays the 'spell' and 'spellcast' equip
-    -- animations and natively spawns the cast VFX on the hands at 'equip start'.
-    -- Cancelling these animations at that text key prevents the VFX from
-    -- appearing when just readying spell stance (as opposed to actually casting
-    -- via OSSC, which uses its own animations).
-    --
-    -- Scoped to SuppressSpellStance: with the setting OFF the native spell
-    -- stance must be indistinguishable from vanilla — hotkeys and the
-    -- ready-magic key raise the hands and play the native equip animations and
-    -- hand VFX, so nothing may cancel them.
+    -- ── Native Spell Stance VFX Suppression ──
+    -- Cancel native 'spell'/'spellcast' equip at 'equip start' (hand VFX). Only with SuppressSpellStance on.
     local function suppressStanceVfx(groupname, key)
-        -- The setting suppresses the native stance animation itself.  During
-        -- a quick-key cast the explicit window below also covers the engine's
-        -- repeated re-raise; the dedicated OSSC cast uses different groups.
+        -- The quick-key window below also covers the engine's re-raise.
         if not (Cfg.general and Cfg.general:get('SuppressSpellStance') == true) then return end
         if Cast.isCasting
             and (Stance.spellStanceAllowed or not Stance.quickkeyWindowActive()) then
@@ -4591,32 +4292,48 @@ end
 debugLog("--- OSSC PLAYER SCRIPT INITIALIZED ---")
 
 local function onSave()
+    reconcileShieldWeapon()
+    local hiddenShield = Cast.suppressedShield
     restoreShieldAfterCast()
     return {
+        hiddenShield = hiddenShield,
         powerCooldowns = OSSC_PowerCooldowns,
         pmmLocations = PMM.pmmLocations,
-        weaponAttackLockActive = weaponAttackLockActive,
-        combatBlockActive = combatBlockActive,
+        -- Save-game key names, read back in onLoad; they are not field paths.
+        weaponAttackLockActive = Cast.weaponAttackLockActive,
+        combatBlockActive      = Cast.combatBlockActive,
     }
 end
 
 local function onLoad(data)
     restoreShieldAfterCast()
+    local hiddenShield = data and data.hiddenShield
+    if hiddenShield and hiddenShield:isValid() then
+        local eq = types.Actor.getEquipment(self)
+        if not eq[SLOT.CarriedLeft] then
+            eq[SLOT.CarriedLeft] = hiddenShield
+            types.Actor.setEquipment(self, eq)
+        end
+    end
     -- External NGarde control is transient engine state and must never survive
     -- loading a save made during a quickcast.
     setNgardeParryControl(false)
+    -- Moving-target lead samples are transient too: drop anything tracked
+    -- before the save so a cast in the first second after a load can never
+    -- estimate a velocity from pre-save positions.
+    targetLead.reset()
     if data and data.powerCooldowns then OSSC_PowerCooldowns = data.powerCooldowns end
     if data and type(data.pmmLocations) == 'table' then PMM.pmmLocations = data.pmmLocations end
     -- The Fighting control switch / combat-control override are engine state
     -- that can survive a save load inside the same session: if the save was
     -- made while one of OSSC's mid-cast locks was engaged, release it
     -- explicitly so attacking is never stuck disabled after the load.
-    if weaponAttackLockActive or (data and data.weaponAttackLockActive) then
-        weaponAttackLockActive = false
+    if Cast.weaponAttackLockActive or (data and data.weaponAttackLockActive) then
+        Cast.weaponAttackLockActive = false
         setWeaponAttackLock(false)
     end
-    if combatBlockActive or (data and data.combatBlockActive) then
-        combatBlockActive = false
+    if Cast.combatBlockActive or (data and data.combatBlockActive) then
+        Cast.combatBlockActive = false
         setCombatBlock(false)
     end
     -- Refresh cached settings on load
@@ -4635,17 +4352,17 @@ local function onLoad(data)
     -- accurate on the very first hotkey press: an equip-only slot leaves the
     -- spell unchanged while the equipment-change guard catches it.
     updatePrevFrameStore()
-    quickkeyPreviousSpellRecordId = Stance.prevFrameSpell
-    quickkeyPreviousItemRecordId  = Stance.prevFrameItem
+    QuickkeyPress.prevSpellRecordId = Stance.prevFrameSpell
+    QuickkeyPress.prevItemRecordId  = Stance.prevFrameItem
     lastSpellHotkeySlot = nil
     -- Native stance/equipment transitions are transient and must not survive
     -- a save load. Start the next quick-key from a fresh suppression window.
     clearQuickkeyStanceSuppression()
     -- No slot has cast an enchanted item in this session yet; require an
     -- actual magic activation (change / spell stance) before the first cast.
-    lastMagicItemHotkeySlot = nil
+    QuickkeyPress.lastMagicItemSlot = nil
     debugLog("onLoad — QuickKey tracking initialised from current selection: spell="
-        ..tostring(quickkeyPreviousSpellRecordId).." item="..tostring(quickkeyPreviousItemRecordId))
+        ..tostring(QuickkeyPress.prevSpellRecordId).." item="..tostring(QuickkeyPress.prevItemRecordId))
 end
 
 --- item and spell in these opts are ids, because we can't serialize full game objects to pass to events
@@ -4655,16 +4372,29 @@ local function OSSC_QuickCast_Handler(opts)
         return
     end
 
-    --get item by id
-    if opts.item then
+    -- Resolve an item record id through the player's actual inventory. A
+    -- stale or foreign id must not fall through to triggerQuickCast as if it
+    -- were an item object.
+    if type(opts.item) == 'userdata'
+        or (type(opts.item) == 'table' and type(opts.item.isValid) == 'function') then
+        if not opts.item:isValid() then return end
+    elseif opts.item then
         local id = opts.item
-        local items = types.Actor.inventory(self):getAll()
+        if type(id) ~= 'string' then return end
+        local inventory = types.Actor.inventory(self)
+        local items = inventory and inventory:getAll() or {}
+        local found
         for _, item in ipairs(items) do
             if item.id == id and item:isValid() then
-                opts.item = item
+                found = item
                 break
             end
         end
+        if not found then
+            debugLog("OSSC_QuickCast: item " .. tostring(id) .. " not in inventory")
+            return
+        end
+        opts.item = found
         --get spell by id
     elseif opts.spell then
         local spell = spellRecs[opts.spell]
@@ -4678,44 +4408,22 @@ end
 
 local function onFrame(dt)
     reconcileShieldWeapon()
-    -- Refresh the crosshair look target every frame. castRenderingRay is only
-    -- legal here (frame/input context); the onUpdate cast path uses the cached
-    -- result. Must run before the early-return below so Touch targeting works
-    -- regardless of the quickkeys/stance settings.
+    -- castRenderingRay is only legal here (onFrame); must run before the early return.
     refreshLookRay()
 
     local isQuickkeysOn  = (Cfg.general and Cfg.general:get('CastOnQuickkeys') == true)
     local isStanceBlockOn = (Cfg.general and Cfg.general:get('SuppressSpellStance') == true)
     if not (isQuickkeysOn or isStanceBlockOn) then
-        -- Nothing below runs while disabled, but the change-detection
-        -- baseline must not go stale: a re-enabled CastOnQuickkeys would
-        -- otherwise compare its first press against an ancient snapshot.
+        -- Keep the baseline fresh while disabled.
         updatePrevFrameStore()
         return
     end
 
     local currentStance = types.Actor.getStance(self)
 
-    -- ── Manual stance keys (R / spell key, F / weapon key) ──────────────────
-    -- The engine processes the native ToggleSpell toggle BEFORE Lua runs, so
-    -- on the rising edge of the spell key `currentStance` is already the
-    -- POST-toggle stance. Enter/exit intent must therefore come from the
-    -- stance on the previous frame (Stance.prevStance), never from the
-    -- current one: testing `currentStance == STANCE.Spell` here inverts the
-    -- intent, and every attempt to LEAVE spell stance is misread as ENTER —
-    -- OSSC then calls setStance(Spell) and the stance can never be unequipped
-    -- (this bit even with SuppressSpellStance off, while CastOnQuickkeys is on).
-    --
-    -- The handler lets the engine perform the actual toggle and only maintains
-    -- `spellStanceAllowed`, so it can never double-toggle against the native
-    -- toggle the engine just consumed. The single exception is ENTER when the
-    -- stance did not change at all: the key press produced no native toggle
-    -- (consumed or ignored), so the stance is raised explicitly — a single
-    -- entry, not a double toggle.
-    --
-    -- This runs in onFrame, ahead of the suppression check below, so the
-    -- suppression always sees the allowance the key press just set — no
-    -- revert-then-re-enter flicker across the onFrame/onUpdate boundary.
+    -- ── Manual stance keys (R / spell, F / weapon) ──
+    -- The native toggle runs before Lua: take intent from Stance.prevStance, never currentStance.
+    -- Only maintain spellStanceAllowed; raise explicitly only if ENTER produced no toggle.
     do
         local spellKeyDown  = false
         local weaponKeyDown = false
@@ -4730,29 +4438,18 @@ local function onFrame(dt)
             end
         end
 
-        -- Stance keys are gameplay keys: ignore edges while a menu is open
-        -- (the engine ignores the native toggle then too), but still track
-        -- the key states so no phantom edge fires when the menu closes.
+        -- Ignore edges while a menu is open, but keep tracking key state.
         local uiMode = ui and ui.activeMode
         if not uiMode and I.UI and I.UI.getMode then uiMode = I.UI.getMode() end
         if uiMode == nil then
-            -- Rising edge on spell key: was in spell stance → EXIT,
-            -- was out of it → ENTER.
+            -- Spell key edge: was Spell → EXIT, else ENTER.
             if spellKeyDown and not Stance.prevSpellKeyDown then
                 if Stance.prevStance == STANCE.Spell then
                     Stance.spellStanceAllowed = false
                     debugLog("[OSSC Stance] User pressed Spell stance key to exit spell stance")
-                    -- No setStance: the engine already left spell stance for
-                    -- this press. An explicit set here would double-toggle
-                    -- straight back into it.
+                    -- No setStance: the engine already left; setting it would double-toggle.
                 else
-                    -- ENTER always works, SuppressSpellStance or not: the
-                    -- blockade only owns the stance a QUICKKEY raises, never
-                    -- the one the player raises by hand. Mods that need the
-                    -- native spell stance (Powers, enchanted items, grimoires,
-                    -- ...) must stay able to open it with the Ready-Magic key.
-                    -- The allowance set here is what tells the suppression
-                    -- below and its onUpdate mirror to leave this stance up.
+                    -- ENTER always allowed; the blockade only owns quickkey-raised stances.
                     Stance.spellStanceAllowed = true
                     debugLog("[OSSC Stance] User pressed Spell stance key to enter spell stance")
                     if currentStance ~= STANCE.Spell then
@@ -4761,38 +4458,14 @@ local function onFrame(dt)
                 end
             end
 
-            -- Rising edge on weapon key: cancel spell stance allowance
-            -- (the engine performs the stance switch itself).
+            -- Weapon key edge: drop the spell allowance (engine switches the stance).
             if weaponKeyDown and not Stance.prevWeaponKeyDown then
                 Stance.spellStanceAllowed = false
                 debugLog("[OSSC Stance] Weapon key pressed — clearing spellStanceAllowed")
             end
         end
 
-        -- If the player returned to a non-spell stance by any other means,
-        -- the manual allowance is spent. This is plain state tracking, NOT a
-        -- key edge, so it must run even while a menu is open: leaving spell
-        -- stance from the inventory/magic menu (the engine lowers the stance
-        -- itself there) is exactly the case that has to clear it. While this
-        -- lived inside the menu guard above, a stale `spellStanceAllowed`
-        -- survived the menu and the very next automatic spell stance was
-        -- mistaken for a manual one — SuppressSpellStance = ON then silently
-        -- stopped suppressing anything for the rest of the session.
-        --
-        -- The clear is deliberately NOT conditioned on the spell key: manual
-        -- spell stance only exists while the stance IS Spell, so whenever the
-        -- stance is observed as non-Spell the allowance is necessarily spent —
-        -- even if the R channel reads held (key-up swallowed by alt-tab or a
-        -- menu transition, a stuck binding, R held through a menu that lowered
-        -- the stance). Conditioning on the key here is what let a stale
-        -- allowance survive those cases and silently disable suppression.
-        --
-        -- The test is the LIVE stance, not the frame-start `currentStance`:
-        -- the ENTER branch above may have raised the stance itself (engine
-        -- toggle consumed), and the manual allowance must survive the very
-        -- frame that raised it. It is also never cleared merely because
-        -- SuppressSpellStance is ON — that setting blocks quickkey-raised
-        -- stances, not the manual one.
+        -- Clear the allowance whenever the LIVE stance is non-Spell, even in menus and whatever the key state.
         local liveStance = types.Actor.getStance(self)
         if liveStance ~= STANCE.Spell then
             Stance.spellStanceAllowed = false
@@ -4800,18 +4473,13 @@ local function onFrame(dt)
 
         Stance.prevSpellKeyDown  = spellKeyDown
         Stance.prevWeaponKeyDown = weaponKeyDown
-        -- Re-read after the ENTER branch above: it is the only stance writer
-        -- in this block, and prevStance must reflect it. Every other in-frame
-        -- stance writer (suppression revert, quickkey revert) refreshes
-        -- prevStance itself right after writing.
+        -- prevStance must reflect the ENTER branch (only stance writer here).
         Stance.prevStance = liveStance
     end
 
     -- ── QuickKey pending cast ────────────────────────────────────────────────
     if QuickkeyPress.slot ~= nil then
-        -- OpenMW's Magic and MagicItem quickkeys enter Spell stance.
-        -- A normal Item quickkey does not. Capture this before OSSC's stance
-        -- suppression restores the previous non-spell stance later this frame.
+        -- Magic/MagicItem quickkeys enter Spell stance, Item ones don't; capture before suppression reverts.
         if not QuickkeyPress.startedInSpellStance
             and currentStance == STANCE.Spell then
             QuickkeyPress.sawSpellStance = true
@@ -4830,10 +4498,10 @@ local function onFrame(dt)
             -- onFrame/onUpdate and leave that cache stale or already changed.
             -- The previous-frame baseline is authoritative for this press.
             local prePressStance  = QuickkeyPress.prePressStance
-            local wasRowSwitch    = pendingQuickkeyPageSwitch
+            local wasRowSwitch    = QuickkeyPress.pendingPageSwitch
             local blockedByCooldown = QuickkeyPress.blockedByCooldown
-            local equipmentAtPress = pendingQuickkeyEquipment
-            local pressTime       = pendingQuickkeyPressTime
+            local equipmentAtPress = QuickkeyPress.pendingEquipment
+            local pressTime       = QuickkeyPress.pendingPressTime
 
             QuickkeyPress.slot                  = nil
             QuickkeyPress.timer                 = 0
@@ -4841,20 +4509,19 @@ local function onFrame(dt)
             QuickkeyPress.prePressStance        = nil
             QuickkeyPress.sawSpellStance        = false
             QuickkeyPress.blockedByCooldown    = false
-            pendingQuickkeyPageSwitch           = false
-            pendingQuickkeyEquipment            = nil
-            pendingQuickkeyPressTime            = 0
+            QuickkeyPress.pendingPageSwitch           = false
+            QuickkeyPress.pendingEquipment            = nil
+            QuickkeyPress.pendingPressTime            = 0
 
             local function revertQuickkeySpellStance()
+                -- A cast started from the stance keeps it (opt-in setting); the
+                -- cast owns the posture until it ends.
+                if allowCastInSpellStance() and Cast.isCasting then return end
                 if not Stance.spellStanceAllowed and isStanceBlockOn then
                     local stance = types.Actor.getStance(self)
                     if stance == STANCE.Spell then
                         debugLog("[OSSC Stance] Reverting automatic QuickKey spell stance")
-                        -- The revert target comes from the shared helper: for a
-                        -- spam press during its own cast, the cast's recorded
-                        -- pre-press stance wins over this press's previous-frame
-                        -- baseline, which the engine's re-raise can already have
-                        -- polluted (see Stance.quickkeyRevertTarget).
+                        -- A spam press during its own cast uses the cast's pre-press stance (see quickkeyRevertTarget).
                         local targetStance = Stance.quickkeyRevertTarget()
                         types.Actor.setStance(
                             self,
@@ -4862,8 +4529,7 @@ local function onFrame(dt)
                         )
                         Stance.suppressWeaponTransitionSounds()
                         restoreQuickkeyWeaponIfEmpty()
-                        -- Keep the pre-toggle intent reference exact: this
-                        -- frame returns early below without another refresh.
+                        -- Returns early below; refresh prevStance now.
                         Stance.prevStance = targetStance
                     end
                 end
@@ -4898,17 +4564,16 @@ local function onFrame(dt)
                 validMagicItem = selectedItemSpell ~= nil
             end
 
-            -- These are directional changes: magic became selected.
-            -- A selection being cleared does not authorize a cast.
+            -- Directional: magic became selected; clearing it doesn't authorize a cast.
             local spellBecameSelected =
                 validSpell
                 and currentSpellRecordId
-                    ~= quickkeyPreviousSpellRecordId
+                    ~= QuickkeyPress.prevSpellRecordId
 
             local magicItemBecameSelected =
                 validMagicItem
                 and currentItemRecordId
-                    ~= quickkeyPreviousItemRecordId
+                    ~= QuickkeyPress.prevItemRecordId
 
             -- Eligibility is based on actual magic-hotkey activity:
             --
@@ -4967,10 +4632,10 @@ local function onFrame(dt)
             -- press activated nothing), and never let the no-change re-cast fire
             -- for a row switch or for a press that equipped something else.
             local effectiveSlot = slotIndex
-            if hotbarSlotOverrideTime > 0
-                and math.abs(hotbarSlotOverrideTime - pressTime)
-                    < HOTBAR_SLOT_MATCH_WINDOW then
-                effectiveSlot = hotbarSlotOverride
+            if QuickkeyPress.hotbarSlotOverrideTime > 0
+                and math.abs(QuickkeyPress.hotbarSlotOverrideTime - pressTime)
+                    < QuickkeyPress.hotbarSlotMatchWindow then
+                effectiveSlot = QuickkeyPress.hotbarSlotOverride
             end
             local equipmentChanged = equipmentChangedSince(equipmentAtPress)
 
@@ -4978,7 +4643,7 @@ local function onFrame(dt)
                 validMagicItem
                 and not magicItemBecameSelected
                 and effectiveSlot ~= nil
-                and effectiveSlot == lastMagicItemHotkeySlot
+                and effectiveSlot == QuickkeyPress.lastMagicItemSlot
                 and not wasRowSwitch
                 and not equipmentChanged
 
@@ -5005,10 +4670,10 @@ local function onFrame(dt)
             -- and the cast branches below still require the magic to be
             -- actually selected, so a stale signal can never cast thin air.
             local sawMagicTile =
-                hotbarMagicActivation ~= nil
-                and hotbarMagicActivation.slot == effectiveSlot
-                and math.abs(hotbarMagicActivation.time - pressTime)
-                    < HOTBAR_SLOT_MATCH_WINDOW
+                Cast.hotbarMagicActivation ~= nil
+                and Cast.hotbarMagicActivation.slot == effectiveSlot
+                and math.abs(Cast.hotbarMagicActivation.time - pressTime)
+                    < QuickkeyPress.hotbarSlotMatchWindow
 
             if blockedByCooldown then
                 debugLog("[OSSC Hotkey] QuickKey slot " .. tostring(slotIndex)
@@ -5041,15 +4706,15 @@ local function onFrame(dt)
                 tostring(sawMagicTile),
                 tostring(spellBecameSelected),
                 tostring(magicItemBecameSelected),
-                tostring(lastMagicItemHotkeySlot),
+                tostring(QuickkeyPress.lastMagicItemSlot),
                 tostring(lastSpellHotkeySlot),
                 tostring(wasRowSwitch),
                 tostring(equipmentChanged),
                 tostring(effectiveSlot),
                 tostring(currentSpellRecordId),
-                tostring(quickkeyPreviousSpellRecordId),
+                tostring(QuickkeyPress.prevSpellRecordId),
                 tostring(currentItemRecordId),
-                tostring(quickkeyPreviousItemRecordId)
+                tostring(QuickkeyPress.prevItemRecordId)
             ))
 
             -- Arm stance suppression before either the no-cast return or the
@@ -5079,18 +4744,15 @@ local function onFrame(dt)
                 return
             end
 
-            -- The slot whose magic was activated by this press. With a paged
-            -- hotbar this is the real (row*10+n) slot, not the physical key.
+            -- Real (row*10+n) slot with a paged hotbar.
             local activatedSlot = effectiveSlot or slotIndex
 
-            -- Selected enchanted items take precedence over the previously
-            -- equipped ordinary spell.
+            -- Enchanted items take precedence over the selected spell.
             if validMagicItem then
                 local enchantmentType = selectedItemSpell.type
                 local enchantmentTypes = ENCHTYPE
 
-                -- Only manually castable enchantments are eligible.
-                -- CastOnStrike and ConstantEffect are equip/proc enchantments.
+                -- Only manually castable enchantments (not CastOnStrike / ConstantEffect).
                 local manuallyCastable =
                     enchantmentType == enchantmentTypes.CastOnUse
                     or enchantmentType == enchantmentTypes.CastOnce
@@ -5107,8 +4769,8 @@ local function onFrame(dt)
                     -- marker too: pressing a slot that used to hold a spell but
                     -- now activates a non-castable enchantment must not re-cast
                     -- that old spell on a later press.
-                    if lastMagicItemHotkeySlot == activatedSlot then
-                        lastMagicItemHotkeySlot = nil
+                    if QuickkeyPress.lastMagicItemSlot == activatedSlot then
+                        QuickkeyPress.lastMagicItemSlot = nil
                     end
                     if lastSpellHotkeySlot == activatedSlot then
                         lastSpellHotkeySlot = nil
@@ -5131,7 +4793,7 @@ local function onFrame(dt)
                 -- while the item is selected, so pressing that spell's own slot
                 -- again (which re-selects the spell) can still re-cast it via
                 -- lastSpellHotkeySlot.
-                lastMagicItemHotkeySlot = activatedSlot
+                QuickkeyPress.lastMagicItemSlot = activatedSlot
 
                 local castIdBefore = Cast.currentCastId
                 Stance.beginQuickkeyCastAttempt()
@@ -5139,14 +4801,11 @@ local function onFrame(dt)
                     item           = selectedEnchantedItem,
                     ignoreUIMode   = true,
                     strictOnlyItem = true,
+                    castSource     = 'quickkey',
                 })
                 if Cast.currentCastId ~= castIdBefore then
                     QuickkeyPress.cooldownActive = true
-                    -- The press resolved into a real cast, so the quickkey
-                    -- handler's own revert paths are already out of scope (its
-                    -- slot was cleared above). Remember the stance that existed
-                    -- before the engine applied the key so animUnlock can put
-                    -- it back when the gesture ends.
+                    -- Real cast: animUnlock restores the pre-press stance.
                     Stance.postCastRestore = prePressStance
                 end
 
@@ -5158,7 +4817,7 @@ local function onFrame(dt)
                 -- A normal spell is now the selected magic (the engine also
                 -- clears the selected enchanted item), so no slot holds an
                 -- enchantment to recast.
-                lastMagicItemHotkeySlot = nil
+                QuickkeyPress.lastMagicItemSlot = nil
 
                 -- Record the slot that cast this spell. Only a repeat press of
                 -- THIS slot — with the same spell still selected and no other
@@ -5171,14 +4830,11 @@ local function onFrame(dt)
                     spell           = currentSpellRecordId,
                     ignoreUIMode    = true,
                     strictOnlySpell = true,
+                    castSource      = 'quickkey',
                 })
                 if Cast.currentCastId ~= castIdBefore then
                     QuickkeyPress.cooldownActive = true
-                    -- The press resolved into a real cast, so the quickkey
-                    -- handler's own revert paths are already out of scope (its
-                    -- slot was cleared above). Remember the stance that existed
-                    -- before the engine applied the key so animUnlock can put
-                    -- it back when the gesture ends.
+                    -- Real cast: animUnlock restores the pre-press stance.
                     Stance.postCastRestore = prePressStance
                 end
 
@@ -5186,14 +4842,12 @@ local function onFrame(dt)
                 debugLog("[OSSC Hotkey] Slot " .. tostring(slotIndex)
                     .. " — magic activation detected, but no valid magic selected.")
 
-                -- Whatever this slot held is gone (spell removed/unselected,
-                -- item swapped out mid-press): forget its markers so a later
-                -- no-change press of the same slot cannot resurrect it.
+                -- Slot's magic is gone: forget its markers.
                 if lastSpellHotkeySlot == activatedSlot then
                     lastSpellHotkeySlot = nil
                 end
-                if lastMagicItemHotkeySlot == activatedSlot then
-                    lastMagicItemHotkeySlot = nil
+                if QuickkeyPress.lastMagicItemSlot == activatedSlot then
+                    QuickkeyPress.lastMagicItemSlot = nil
                 end
             end
 
@@ -5203,17 +4857,9 @@ local function onFrame(dt)
         end
     end
 
-    -- NOTE: there is deliberately NO general suppression of Spell stance
-    -- here. The blockade is scoped to QUICKKEY-raised stances only: it owns
-    -- the resolve-time revert (revertQuickkeySpellStance, above) and the
-    -- pending-gated revert in the onUpdate mirror. A stance raised any
-    -- other way — R key, menu, inventory, hotbar click, another mod — is
-    -- the player's own doing and is never touched, so the manual stance
-    -- can no longer be eaten by a revert racing the stance key across the
-    -- onFrame/onUpdate boundary.
+    -- No general Spell-stance suppression here: the blockade is quickkey-only.
 
-    -- Keep weapon equip/unequip sounds silent while the suppression window
-    -- is active (covers late raises and the draw that follows a revert).
+    -- Silence equip sounds while the window is active.
     if Stance.nativeQuickkeySuppression and not Stance.spellStanceAllowed then
         Stance.suppressWeaponTransitionSounds()
     end
@@ -5310,17 +4956,43 @@ local function castSpellAtTarget(args)
         return false, 'target must be an actor, an object or a util.vector3'
     end
 
-    -- Same shape as the quick-cast model, so every shared helper (penalty
-    -- exemption, dominant school) reads it the same way.
+    -- Same shape as the quick-cast model for shared helpers.
     local firstEffect = record.effects and record.effects[1]
     local spell = {
         id      = spellId,
         type    = record.type,
         cost    = record.cost or 0,
         effects = record.effects,
-        area    = firstEffect and firstEffect.area or 0,
+        -- The blast radius a launch reports is the largest area among the
+        -- record's TARGET-range effects (`ossc_cast_rules.impactArea`), the
+        -- same rule the quick-cast path uses. `firstEffect.area` was wrong for
+        -- every spell whose first effect is not the exploding one -- the usual
+        -- layout, e.g. a Self rider in front of a Target blast -- and those
+        -- casts were handed to Spell Framework Plus with `area = 0`, i.e. no
+        -- explosion at all.
+        area    = require('scripts.ossc.ossc_cast_rules').impactArea(record),
         range   = firstEffect and firstEffect.range or RANGE.Self,
     }
+
+    -- Mod cast veto: an external request is still a cast this player makes, so
+    -- a mod's own rule applies to it too (and it must, or a mod could be talked
+    -- past its own restriction by routing the cast through castSpellAtTarget).
+    if castRulesModule.hasCastVeto() then
+        local payload = castRulesModule.castPayload(spell, {
+            source = 'external', caster = self,
+        })
+        local vetoAllowed, vetoReason, vetoMessage =
+            castRulesModule.checkCastVeto(payload)
+        if not vetoAllowed then
+            return castRulesModule.reportVetoedCast(self, payload, vetoReason,
+                vetoMessage, {
+                    log         = debugLog,
+                    showMessage = ui.showMessage,
+                    fizzle      = Cfg.general
+                        and Cfg.general:get('CastVetoFeedback') ~= 'Silent',
+                })
+        end
+    end
 
     local startPos = self.position
     local direction = self.rotation * util.vector3(0, 1, 0)
@@ -5329,7 +5001,12 @@ local function castSpellAtTarget(args)
         targetObj, targetPos = self, self.position
         hitObject, hitPos = self, self.position
     elseif targetPos then
-        local aim = targetPos + EXTERNAL_CAST_AIM_OFFSET
+        -- Vanilla parity (CastSpell::launchMagicBolt): the aim point on an
+        -- actor is the centre of its bounding box, never a fixed height above
+        -- its feet — that is what makes the bolt (and the hit effect spawned
+        -- at the impact) land on the actor instead of at them.
+        local aim = require('scripts.ossc.ossc_cast_rules').actorAimPoint(targetObj, EXTERNAL_CAST_AIM_OFFSET.z)
+            or (targetPos + EXTERNAL_CAST_AIM_OFFSET)
         direction = (aim - startPos):normalize()
         hitPos = aim
         if spell.range == RANGE.Touch then hitObject = targetObj end
@@ -5394,13 +5071,33 @@ end
 
 local OSSC_EventHandlers = {}
 
+--- Stop the cast in flight, on another mod's request (Sane Magic's
+--- `dropSpell`, a dialogue that must interrupt a cast, …). Everything the cast
+--- started is torn down and NOTHING is launched: a cast whose release has not
+--- happened yet never fires, and a release already queued for this cast is
+--- dropped. Magicka already paid at the animation start stays paid, exactly as
+--- vanilla handles an interrupted cast.
+--- Returns true when a cast was actually stopped.
+local function cancelCurrentCast(reason)
+    if not Cast.isCasting and #Cast.pendingLaunches == 0 then
+        debugLog('Cancel request ignored — nothing is being cast')
+        return false
+    end
+    local label = 'cancelled by a mod: ' .. tostring(reason or 'no reason given')
+    debugLog('Cast ' .. label)
+    fullCleanup(label)
+    return true
+end
+
 return {
     engineHandlers = { onUpdate=onUpdate, onFrame=onFrame, onSave=onSave, onLoad=onLoad },
     interfaceName = 'OSSC',
     interface = {
         triggerQuickCast = triggerQuickCast,
         isCasting = function() return Cast.isCasting end,
-        version = 1,
+        -- v2: awardSkillProgress takes vanilla skill-use points, not level fractions.
+        -- v3: addCastVeto / removeCastVeto / cancelCurrentCast.
+        version = 3,
 
         --- Cast a spell right now, without the quick-cast animation (see the
         --- block above).  Returns true when the request was handed to Spell
@@ -5415,7 +5112,14 @@ return {
         --- from the authoritative player-settings storage, so a menu change
         --- is visible immediately.
         getQuickCastFullChanceDistance = function()
-            return tonumber(Cfg.npc and Cfg.npc:get('NPCQuickCastMinDistance')) or 500
+            -- Same clamp the actor scripts apply: the menu allows a Full Chance
+            -- Distance larger than the Maximum Cast Distance, and the roll then
+            -- uses the Maximum as the end of the full-chance band. The raw
+            -- setting would make this read-out disagree with the casters.
+            local minDist = tonumber(Cfg.npc and Cfg.npc:get('NPCQuickCastMinDistance')) or 500
+            local maxDist = tonumber(Cfg.npc and Cfg.npc:get('NPCQuickCastMaxDistance')) or 700
+            if minDist > maxDist then minDist = maxDist end
+            return minDist
         end,
 
         --- Every NPC/creature quick-cast setting (the SettingsOSSC_NPC
@@ -5444,6 +5148,33 @@ return {
             table.insert(OSSC_EventHandlers, handler)
         end,
 
+        --- ── Cast veto: the way to REFUSE an OSSC cast ─────────────────────
+        --- `addCastHandler` above runs after the cast has been handed to Spell
+        --- Framework Plus, so it can only report. A veto runs before anything
+        --- is played or paid and can refuse: spells, scrolls and enchanted
+        --- items, from hotkeys, quickkeys, hotbar tiles and
+        --- `castSpellAtTarget`. Registering/deregistering is global across the
+        --- player script and the NPC/creature casters, so one call covers
+        --- every caster (an NPC's own veto can look at `cast.caster`).
+        ---
+        ---     local token = I.OSSC.addCastVeto(function(cast)
+        ---         if not I.SaneMagic.checkEffects(cast.effects, cast.isScroll,
+        ---                                        cast.cost) then
+        ---             return false, 'skill too low', 'Your skill is too low.'
+        ---         end
+        ---         return true
+        ---     end)
+        ---     I.OSSC.removeCastVeto(token)
+        ---
+        --- Returns a token, or nil plus a reason when it is not a function.
+        addCastVeto    = castRulesModule.addCastVeto,
+        removeCastVeto = castRulesModule.removeCastVeto,
+        hasCastVeto    = castRulesModule.hasCastVeto,
+
+        --- Stop the cast in flight (nothing is launched). True when there was
+        --- one. Sane Magic's `OSSC_CancelCast` global event is also honoured.
+        cancelCurrentCast = cancelCurrentCast,
+
         -- ── Paged hotbar mod integration (QuickSelect Ultimate & co.) ──────
         -- Hotbar mods that reuse the QuickKey1-9 input actions can tell OSSC
         -- what a press really did. Without this, a press that only switches
@@ -5456,7 +5187,7 @@ return {
         --   veto is also remembered for a short window so it works no matter
         --   which mod's input handler the engine runs first.
         cancelPendingQuickkey = function(slot)
-            quickkeyVetoUntil = realTimeNow() + QUICKKEY_VETO_WINDOW
+            QuickkeyPress.vetoUntil = realTimeNow() + QuickkeyPress.vetoWindow
             if slot ~= nil and QuickkeyPress.slot ~= nil
                 and QuickkeyPress.slot ~= slot then
                 return
@@ -5471,9 +5202,9 @@ return {
             QuickkeyPress.prePressStance        = nil
             QuickkeyPress.sawSpellStance        = false
             QuickkeyPress.blockedByCooldown    = false
-            pendingQuickkeyPageSwitch           = false
-            pendingQuickkeyEquipment            = nil
-            pendingQuickkeyPressTime            = 0
+            QuickkeyPress.pendingPageSwitch           = false
+            QuickkeyPress.pendingEquipment            = nil
+            QuickkeyPress.pendingPressTime            = 0
         end,
 
         -- notifyQuickkeyActivation(slot)
@@ -5482,8 +5213,8 @@ return {
         --   nothing at all. OSSC uses it to decide whether this press is a
         --   repeat of the slot that cast the current magic item.
         notifyQuickkeyActivation = function(slot)
-            hotbarSlotOverride     = slot
-            hotbarSlotOverrideTime = realTimeNow()
+            QuickkeyPress.hotbarSlotOverride     = slot
+            QuickkeyPress.hotbarSlotOverrideTime = realTimeNow()
             debugLog("[OSSC Hotkey] Hotbar mod reported activated slot="
                 .. tostring(slot))
         end,
@@ -5501,21 +5232,25 @@ return {
         --   notifyQuickkeyActivation) and the magic must still be selected
         --   when the press resolves, so only genuine magic-tile presses cast.
         notifyMagicTileActivation = function(slot)
-            hotbarMagicActivation = { slot = slot, time = realTimeNow() }
+            Cast.hotbarMagicActivation = { slot = slot, time = realTimeNow() }
             debugLog("[OSSC Hotkey] Hotbar mod reported magic-tile activation slot="
                 .. tostring(slot))
         end,
     },
     eventHandlers  = {
+        OSSC_ExternalCastRequest = function(data)
+            local accepted, reason = castSpellAtTarget(data)
+            if not accepted then
+                debugLog('External cast request refused: ' .. tostring(reason))
+            end
+        end,
         OSSC_OnSpellCast = function(data)
             for _, handler in ipairs(OSSC_EventHandlers) do
                 handler(data)
             end
         end,
 
-        -- Spell filter, pushed by the global script on every change (and on
-        -- request).  Kept as a mirror so isSpellIgnored keeps working even if
-        -- the global interface is not reachable.
+        -- Spell filter mirror pushed by the global script.
         OSSC_SetIgnoredSpells = function(data)
             if type(data) ~= 'table' then return end
             ignoredSpellMirror = {}
@@ -5527,6 +5262,12 @@ return {
             ignoredSpellMirrorAsked = true
         end,
         OSSC_QuickCast = OSSC_QuickCast_Handler,
+
+        --- Global-event form of `cancelCurrentCast`, for another mod's global
+        --- script: `core.sendGlobalEvent('OSSC_CancelCast', { reason = '…' })`.
+        OSSC_CancelCast = function(data)
+            cancelCurrentCast(type(data) == 'table' and data.reason or nil)
+        end,
 
         -- While the PMM recall window waits for input, leaving Interface mode
         -- without picking a mark (Esc / another menu taking over) must not
@@ -5548,10 +5289,7 @@ return {
             selectedMark(0)
         end,
 
-        -- OpenMW's built-in omw.music actor script sends this event to every
-        -- nearby player when an actor's combat-target list changes. Forward it
-        -- to OSSC's global attachment manager; only actors with a live combat
-        -- target receive their NPC/Creature scripts.
+        -- omw.music sends this on combat-target changes; forward to the global attachment manager.
         OMWMusicCombatTargetsChanged = function(data)
             if data and data.actor then
                 core.sendGlobalEvent('OSSC_CombatTargetsChanged', data)

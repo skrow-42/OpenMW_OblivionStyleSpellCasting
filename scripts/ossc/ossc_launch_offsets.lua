@@ -1,38 +1,11 @@
 ---@omw-context none
 -- ============================================================================
--- OSSC: Oblivion-Style Spell Casting
--- ossc_launch_offsets.lua  (EDITABLE DATA FILE — no code changes needed)
---
--- Per-animation launch offsets for targeted/touch spell launches.
---
--- Every animation group gets its own set of values, separately for first
--- person and third person. The Eternal Grimoire (right-hand cast) uses ONE
--- global set (GRIMOIRE below) that applies to every animation.
---
--- ── AXES (all values in game units; 1 unit ≈ 1.4 cm) ──────────────────────
---   forward : distance along the caster's view/facing direction.
---             Positive = further in front of the camera.
---   left    : lateral distance from the screen center.
---             POSITIVE = to the LEFT (normal left-hand casts).
---             NEGATIVE = to the RIGHT (e.g. right-hand casts).
---   up      : vertical distance.
---             Positive = higher, negative = lower.
---
--- ── WHERE THE OFFSET IS APPLIED FROM ───────────────────────────────────────
---   first person : from the CAMERA position (screen center / eye level).
---   third person : from the ACTOR origin (feet) along the camera yaw —
---                  that is why 'third.up' defaults to ~115 (chest height).
---   NPCs/creatures always use the 'third' table (they have no camera),
---                  applied from the actor origin along the actor facing.
---
--- ── HOW TO TUNE ────────────────────────────────────────────────────────────
---   * Edit the numbers below and save. Changes apply the next time the Lua
---     scripts are loaded (restart OpenMW or load a save).
---   * You may delete per-key entries: anything missing falls back to the
---     matching DEFAULT value (so you only need to list what you change).
---   * Unknown/typo'd animation names simply fall back to DEFAULT.
---   * The fallback animation used when a skeleton lacks an animation
---     (quickbuff / quickcast / eqcastr) is tunable here like any other.
+-- OSSC launch offsets (editable data file)
+-- Per-animation offsets, first and third person; GRIMOIRE is one global set.
+-- Units: game units (1 ≈ 1.4 cm). forward = along facing, left = +left/-right, up = +up.
+-- First person: from camera. Third person: from actor feet along camera yaw (up ≈ 115 = chest).
+-- NPCs/creatures use 'third' along actor facing.
+-- Applied on Lua reload. Missing keys/animations fall back to DEFAULT.
 -- ============================================================================
 
 local DEFAULT = {
@@ -94,9 +67,8 @@ local ANIMS = {
     },
 }
 
--- ── helpers (no need to edit below this line) ──────────────────────────────
--- Every entry is resolved once at load time; the getters hand out the same
--- read-only tables on every call.
+-- ── helpers ──
+-- Resolved once at load; getters return shared read-only tables.
 
 local function num(v, fallback)
     local n = tonumber(v)
@@ -125,8 +97,7 @@ local GRIMOIRE_THIRD = resolve(GRIMOIRE.third, DEFAULT.third)
 
 local M = {}
 
--- Returns { forward, left, up } for the given animation group.
--- `firstPerson` selects the 'first' vs 'third' table (NPCs pass false).
+-- Returns { forward, left, up }. NPCs pass firstPerson = false.
 function M.get(animGroup, firstPerson)
     if firstPerson then return FIRST[animGroup] or DEFAULT.first end
     return THIRD[animGroup] or DEFAULT.third

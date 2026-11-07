@@ -1,18 +1,8 @@
 ---@omw-context runtime
 -- ============================================================================
--- OSSC: Friendlier Fire compatibility gate (self-contained).
---
--- Spell Framework Plus applies OSSC casts from Lua via ActiveSpells:add().
--- That path skips the engine's CastSpell::inflict / ApplyMagicEffects, so
--- Friendlier Fire's own spell sweep can never see these casts. OSSC therefore
--- detects friendly fire itself, using Follower Detection Util's follower list
--- and the same test Friendlier Fire uses, and skips harmful quick-casts aimed
--- at followers or summons (and keeps followers from quick-casting harmful
--- spells at the player or each other).
---
--- Friendlier Fire's settings are honoured read-only (when FF is installed), so
--- its "disable spell protection", command, summon and blacklist options keep
--- working. With neither FF nor FDU installed this is a no-op.
+-- OSSC: Friendlier Fire compatibility gate
+-- SFP applies casts via ActiveSpells:add(), bypassing FF's sweep, so check here using FDU followers.
+-- FF settings honoured read-only. No-op without FF and FDU.
 -- ============================================================================
 local core       = require('openmw.core')
 local types      = require('openmw.types')
@@ -68,22 +58,18 @@ local function hasBlacklistedScript(target)
     return false
 end
 
--- Mirrors Friendlier Fire's victim-side gates: spells are only protected when
--- FF's spell protection is on, the victim is not commanded, and the victim is
--- not a summon / blacklisted actor that FF has opted out of protecting.
+-- Mirrors FF's victim-side spell protection gates.
 local function spellProtectionActive(target)
     if not (target and types.Actor.objectIsInstance(target)) then return false end
     if not getFfSetting('disableSpells', true) then return false end
-    -- FF's command check only applies to follower victims (its player path
-    -- has no command gate), so mirror that: non-player targets only.
+    -- FF's command check applies to non-player victims only.
     if target.type == types.Player then return true end
     if getFfSetting('commandDisablesProtection', true) and isCommanded(target) then return false end
     if isSummonRecord(target.recordId) and not getFfSetting('protectSummons', true) then return false end
     return not hasBlacklistedScript(target)
 end
 
--- Same test as Friendlier Fire's isFriendlyFire (caster and victim are both
--- friendly, and the caster is not the victim).
+-- Same test as FF's isFriendlyFire.
 local function isFriendlyPair(caster, target, followers)
     if caster.id == target.id then return false end
     local casterState = followers[caster.id]

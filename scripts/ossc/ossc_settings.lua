@@ -1,11 +1,7 @@
 ---@omw-context player
 -- ============================================================================
--- OSSC: Oblivion-Style Spell Casting — settings registration (PLAYER script).
---
--- Registers the OSSC_QuickCast input action and every settings page/group,
--- then mirrors the player settings groups into global storage (see the
--- "Settings mirror" section at the bottom) so the global and actor scripts
--- can read them.
+-- OSSC settings registration (PLAYER script)
+-- Registers input action and settings pages, then mirrors groups to global storage.
 -- ============================================================================
 local I       = require('openmw.interfaces')
 local input   = require('openmw.input')
@@ -30,20 +26,13 @@ input.registerAction {
 
 -- ============================================================================
 -- Settings mirror
---
--- OSSC's settings groups are PLAYER settings, and player storage is only
--- readable from player/menu scripts (storage.playerSection). The global
--- script and the NPC/creature actor scripts could therefore never see menu
--- values — e.g. disabling quickcast for creatures had no effect.
--- Mirror every relevant group into GLOBAL storage (same section names) via
--- the OSSC_SyncSettings event: on load, and whenever a setting changes.
---
--- SettingsOSSC_Keys is included so EnablePlayerSwirls / EnableHandSwirls /
--- EnableCastGlow also reach NPC and eligible-creature scripts (they cannot
--- read player storage).
+-- Player storage is player/menu-only; copy groups to global storage via OSSC_SyncSettings on load and change.
 -- ============================================================================
 local MIRRORED_GROUPS = {
     'SettingsOSSC_General',
+    -- The decision settings (NPCAI*, once their own group) live in
+    -- SettingsOSSC_NPC now and are mirrored with it; the old group is only
+    -- still touched below to erase its retired keys.
     'SettingsOSSC_NPC',
     'SettingsOSSC_Animations',
     'SettingsOSSC_AnimSpeeds',
@@ -66,8 +55,7 @@ local function syncAllGroups()
     end
 end
 
--- storage passes the changed section's name as the first argument, so one
--- callback serves every mirrored group.
+-- Callback receives the section name.
 local onMirroredGroupChanged = async:callback(syncGroup)
 
 for _, group in ipairs(MIRRORED_GROUPS) do
@@ -90,13 +78,26 @@ end
 I.Settings.registerPage({
     key         = 'OSSCPage',
     l10n        = 'OSSC',
-    name        = 'Oblivion-Style Spell Casting v4.3a',
-    description = 'Settings for the OSSC Mod\n\nSpecial thanks to Dubiousnpc for his fantastic work on OSSC animations'
+    name        = 'Oblivion-Style Spell Casting v4.4',
+    description = 'Settings for the OSSC Mod\n\nSpecial thanks to Dubiousnpc for his fantastic work on OSSC animations and also all the people that helped in the development by reporting bugs or sending fixes!'
 })
 
 -- ── Group 1: General ──────────────────────────────────────────────────
 
-I.Settings.registerGroup({
+-- The number renderer reads its bounds from `argument`, not from the setting
+-- table. Normalize legacy top-level min/max values before every registration.
+local function registerGroup(group)
+    for _, setting in ipairs(group.settings or {}) do
+        if setting.renderer == 'number' and (setting.min ~= nil or setting.max ~= nil) then
+            setting.argument = setting.argument or {}
+            if setting.argument.min == nil then setting.argument.min = setting.min end
+            if setting.argument.max == nil then setting.argument.max = setting.max end
+        end
+    end
+    I.Settings.registerGroup(group)
+end
+
+registerGroup({
     key              = 'SettingsOSSC_Keys',
     page             = 'OSSCPage',
     l10n             = 'OSSC',
@@ -116,7 +117,7 @@ I.Settings.registerGroup({
             key         = 'QuickCastTrigger',
             name        = 'Quick Cast - Gamepad Trigger (Left/Right)',
             renderer    = 'select',
-            default     = 'none',
+            default     = 'Disabled',
             argument    = {
                 disabled = false,
                 l10n     = 'OSSC',
@@ -156,18 +157,15 @@ I.Settings.registerGroup({
 -- ── Group 2: Gameplay ─────────────────────────────────────────────────
 local generalStorage     = storage.playerSection('SettingsOSSC_General')
 
--- The penalty values, their display order and the multiplier each one means all
--- live in scripts/ossc/ossc_penalty.lua, shared with the player script.
+-- Penalty values live in ossc_penalty.lua.
 local Penalty = require('scripts.ossc.ossc_penalty')
 local penaltySelectItems = Penalty.items
 
--- Same arrangement for the skill progression modes; see
--- scripts/ossc/ossc_skillmodes.lua.
+-- Skill modes live in ossc_skillmodes.lua.
 local SkillModes = require('scripts.ossc.ossc_skillmodes')
 local skillModeSelectItems = SkillModes.items
 
--- Older releases stored the penalty settings as numbers / display strings;
--- map them onto the select values once so the renderer can show them.
+-- Legacy penalty values -> select values.
 local PENALTY_ALIASES = {
     disabled = 'off', ossc_penalty_off = 'off',
     ['reduce 25%'] = 'reduce_25', ['25%'] = 'reduce_25', ['-25%'] = 'reduce_25', ossc_penalty_25 = 'reduce_25',
@@ -192,12 +190,7 @@ end
 migratePenaltyKey('QuickCastChancePenalty')
 migratePenaltyKey('QuickCastEffectPenalty')
 
--- The skill-based penalty used to be a separate checkbox next to each select
--- ("… — Skill Based"), overriding whatever flat percentage was picked. It is
--- now the last item of the select itself. Fold a ticked checkbox into the
--- select once, then drop the checkbox key: it is no longer registered, and
--- leaving it behind would re-apply 'skill_based' on every load after the
--- player has gone back to a flat percentage.
+-- Fold the legacy skill-based checkbox into the select once, then drop it (else it re-applies every load).
 local function migrateSkillBasedCheckbox(selectKey, checkboxKey)
     local ticked = generalStorage:get(checkboxKey)
     if ticked == nil then return end
@@ -209,10 +202,7 @@ end
 migrateSkillBasedCheckbox('QuickCastChancePenalty', 'QuickCastChancePenaltySkillBased')
 migrateSkillBasedCheckbox('QuickCastEffectPenalty', 'QuickCastEffectPenaltySkillBased')
 
--- The Shield Casting Penalty used to be Off / Reduced / Full with its own
--- skill-based checkbox; it is now one select of strengths (Off / 10%..100% /
--- Skill based). 'reduced' is 50%, 'full' is 100%; the checkbox folds in the
--- same way as the two above.
+-- Legacy shield penalty: 'reduced' = 50%, 'full' = 100%; checkbox folds in as above.
 do
     local v = generalStorage:get('ShieldCastingPenalty')
     if v ~= nil and not Penalty.shield.valid[tostring(v)] then
@@ -221,11 +211,7 @@ do
 end
 migrateSkillBasedCheckbox('ShieldCastingPenalty', 'ShieldCastingPenaltySkillBased')
 
--- The effect-penalty exclusion used to cover regular spells as well as scrolls
--- (QuickCastEffectPenaltyScrollsSpellsExempt). Only scrolls are meant to be
--- excluded — a scroll is consumed by the cast, so a penalised one is lost for a
--- weakened effect, whereas a spell can simply be cast again — so the toggle now
--- says exactly that. Carry the old choice over once and drop the old key.
+-- Migrate QuickCastEffectPenaltyScrollsSpellsExempt to scrolls-only once.
 do
     local OLD_KEY, NEW_KEY = 'QuickCastEffectPenaltyScrollsSpellsExempt', 'QuickCastEffectPenaltyScrollsExempt'
     local old = generalStorage:get(OLD_KEY)
@@ -237,10 +223,7 @@ do
     end
 end
 
--- 'ncg+se' and 'ncg+se (auto)' were dropped as separate choices: both ran the
--- same external handler chain as 'skillevo'. Rewrite a stored value the current
--- menu no longer offers so the renderer can show it and the player script reads
--- the mode that was actually meant.
+-- Rewrite dropped 'ncg+se' modes to 'skillevo'.
 do
     local v = generalStorage:get('SkillProgressionMode')
     if v ~= nil and not SkillModes.valid[tostring(v)] then
@@ -248,7 +231,59 @@ do
     end
 end
 
-I.Settings.registerGroup({
+-- Retired settings are erased before mirroring so legacy values cannot keep
+-- travelling to actor scripts after their menu controls are gone. Target
+-- selection stays fixed to engine combat targets only. The old AI preset only
+-- wrote cadence keys that the NPC runtime never read; the M3 policy selectors
+-- were also unread. Remove those stale values without changing current M2
+-- behavior. Combo Chains is no longer a setting either: Strict Sequences is
+-- the only behaviour, so the old key (which used to migrate TagChains to
+-- StrictSequences) is erased outright.
+do
+    local aiStorage = storage.playerSection('SettingsOSSC_NPC_AI')
+    for _, key in ipairs({
+        'NPCAITargetChoice', 'NPCAITargetPriority', 'NPCAITargetOrder',
+        'NPCAIHostileCandidates', 'NPCAIScanInterval',
+        'NPCAIPreset', 'NPCAIDecisionMode', 'NPCAITargetKnowledge',
+        'NPCAIMatchupAwareness', 'NPCAISnapshotTTL',
+        'NPCAIShortlistCap', 'NPCAIAllyRefresh',
+        -- Replaced by NPCAIWeaknessMinMagnitude; seconds are not percentages.
+        'NPCAIWeaknessMinDuration',
+    }) do
+        if aiStorage:get(key) ~= nil then aiStorage:set(key, nil) end
+    end
+    if aiStorage:get('NPCAICombos') ~= nil then
+        aiStorage:set('NPCAICombos', nil)
+    end
+    -- Timings that became constants, and the decision setting that was merged
+    -- into NPCQuickCastHealThreshold: their controls are gone, so erase the
+    -- stored values — a stale value must not survive a load and resurface.
+    local npcSection = storage.playerSection('SettingsOSSC_NPC')
+    for _, key in ipairs({
+        'NPCMercyQuickcastWindow', 'NPCQuickCastEquipReadiness',
+        'NPCVanillaCastUnequipTimeout', 'NPCVanillaCastAllowanceReadiness',
+        'NPCPauseResumeGrace',
+    }) do
+        if npcSection and npcSection:get(key) ~= nil then
+            npcSection:set(key, nil)
+        end
+    end
+    if aiStorage:get('NPCAIHealCriticalFloor') ~= nil then
+        aiStorage:set('NPCAIHealCriticalFloor', nil)
+    end
+    if npcSection and npcSection:get('NPCAIHealCriticalFloor') ~= nil then
+        npcSection:set('NPCAIHealCriticalFloor', nil)
+    end
+    if generalStorage:get('QuickCastTargetLeading') ~= nil then
+        generalStorage:set('QuickCastTargetLeading', nil)
+    end
+    local npcStorage = storage.playerSection('SettingsOSSC_NPC')
+    if npcStorage:get('NPCMercyCAOMode') ~= nil then
+        npcStorage:set('NPCMercyCAOMode', nil)
+    end
+end
+
+registerGroup({
     key              = 'SettingsOSSC_General',
     page             = 'OSSCPage',
     l10n             = 'OSSC',
@@ -274,7 +309,7 @@ I.Settings.registerGroup({
             renderer    = 'number',
             default     = 5.0,
             min         = 0.0,
-            max         = 10.0,
+            max         = 50.0,
         },
 
         {
@@ -304,6 +339,7 @@ I.Settings.registerGroup({
         {
             key         = 'QuickCastEffectPenaltyScrollsExempt',
             name        = 'Quick Cast Effect Penalty — Exclude Scrolls',
+            description = 'Exclude scrolls from the effect penalty if it is enabled. Powers are always excluded.',
             renderer    = 'checkbox',
             default     = true,
         },
@@ -316,7 +352,7 @@ I.Settings.registerGroup({
         },
         {
             key         = 'EnableSpeedyMagick',
-            name        = 'Enable SpeedyMagick Animation Speed Scaling',
+            name        = 'Enable SpeedyMagick Animation Speed Scaling/Compatibility',
             renderer    = 'checkbox',
             default     = false
         },
@@ -326,6 +362,13 @@ I.Settings.registerGroup({
             description = 'USE ONLY WITH ENABLED\n[Enable Block / Suppress Spell Stance]',
             renderer    = 'checkbox',
             default     = true
+        },
+        {
+            key         = 'AllowQuickCastInSpellStance',
+            name        = 'Allow Quick-Cast In Spell Stance',
+            description = 'Quickcasts are blocked in spell stance for every actor. if disabled.',
+            renderer    = 'checkbox',
+            default     = false,
         },
         {
             key         = 'SuppressSpellStance',
@@ -355,7 +398,7 @@ I.Settings.registerGroup({
         },
         {
             key         = 'BlockDuringCombatAnims',
-            name        = 'Block Quick Cast During Fighting Animations (2 Handed)',
+            name        = 'Block Quick Cast During Attack Animations (2 Handed)',
             description = 'Prevents quick-casting when both hands are occupied. Applies to all eligible actors.',
             renderer    = 'checkbox',
             default     = true
@@ -388,6 +431,14 @@ I.Settings.registerGroup({
             default     = true
         },
         {
+            key         = 'CastVetoFeedback',
+            name        = 'Sane Magic Mod sound setting',
+            description = 'Choose if the failure from Sane Magic will be Vanilla-style or silent.',
+            renderer    = 'select',
+            argument    = { l10n = 'OSSC', items = { 'Vanilla', 'Silent' } },
+            default     = 'Vanilla',
+        },
+        {
             key         = 'AllowAttackingWhileCasting',
             name        = 'Allow Attacking While Quick-Casting',
             description = 'Enables more dynamic combat.',
@@ -398,13 +449,13 @@ I.Settings.registerGroup({
             key         = 'PureMultiMarkCompat',
             name        = 'Enable Pure LUA Multi Mark Mod Compatibility',
             renderer    = 'checkbox',
-            default     = true
+            default     = false
         },
         {
             key         = 'SkillProgressionMode',
             name        = 'Skill Progression Mode',
             description =
-                'OSSC : Legacy mode. Uses OSSC flat XP formula.\n\n' ..
+                'OSSC : Vanilla skill-use gains, class bonuses and skill-level requirements.\n\n' ..
                 'NCG : Natural Character Growth. Engine handles progress; NCG reacts on level-up.\n' ..
                 'SKILLEVO : Skill Evolution. SE intercepts skillUsed and runs its full handler chain. SE detects whether MBSP is enabled on its own, so this covers what the old NCG+SE choices did.\n\n' ..
                 'SUS : Skill Uses Scaled. Patches SUS spell pointer before calling skillUsed.\n' ..
@@ -421,7 +472,8 @@ I.Settings.registerGroup({
         },
             {
             key         = 'SkillExperience',
-            name        = 'Skill Experience Ratio (OSSC legacy skill progression mode only)',
+            name        = 'Skill Experience Ratio (OSSC mode only)',
+            description = 'Multiplier for the loaded skill record gain: 1 = vanilla parity, 0 = no experience, 2 = double. Not a percentage of a skill level. Explicit awardSkillProgress gains are not multiplied.',
             renderer    = 'number',
             default     = 1.0,
             min         = 0,
@@ -463,13 +515,17 @@ I.Settings.registerGroup({
     }
 })
 
--- ── Group 5: NPC Quick-Casting ─────────────────────────────────────────
-I.Settings.registerGroup({
+-- ── Group 3: NPC & Creature Quick-Casting ─────────────────────────────
+-- The decision settings (thresholds, reactions, combos, exclusions, ally
+-- casting, debug logging) live here too — one page for everything an NPC or
+-- creature does with a quick-cast. They keep their NPCAI* storage keys, so
+-- existing saves and the settings mirror read back unchanged.
+registerGroup({
     key              = 'SettingsOSSC_NPC',
     page             = 'OSSCPage',
     l10n             = 'OSSC',
     name             = 'NPC & Creature Quick-Casting',
-    description      = 'Configure Oblivion-Style quick-casting for combat NPCs and eligible creatures. \nChanges do NOT apply to entities currently in combat.',
+    description      = 'Configure Oblivion-Style quick-casting for combat NPCs and eligible creatures. \nChanges apply live.',
     permanentStorage = true,
     order            = 3,
     settings         = {
@@ -529,8 +585,8 @@ I.Settings.registerGroup({
         },
         {
             key         = 'NPCQuickCastMinDistance',
-            name        = 'Melee / Touch Distance (units)',
-            description = 'Distance at or below which quick-casting probability reaches maximum.',
+            name        = 'Full Chance Distance (units)',
+            description = 'Distance at or below which quick-casting probability reaches maximum. Touch spells are not tied to this: NPCs and creatures may only touch-cast within the same vanilla touch reach as the player.',
             renderer    = 'number',
             default     = 500,
             min         = 50,
@@ -541,7 +597,7 @@ I.Settings.registerGroup({
             name        = 'Maximum Cast Distance (units)',
             description = 'Distance at or beyond which quick-casting probability is 0%.',
             renderer    = 'number',
-            default     = 700,
+            default     = 2200,
             min         = 300,
             max         = 3500,
         },
@@ -555,22 +611,153 @@ I.Settings.registerGroup({
             max         = 80,
         },
         {
+            key         = 'NPCQuickCastTouchChance',
+            name        = 'In Touch Reach: Touch Spell Weight (0-100%)',
+            description = 'Favor of Touch spells after the actor has cast all missing Self buffs, when the target is within vanilla touch reach.',
+            renderer    = 'number',
+            default     = 80,
+            min         = 0,
+            max         = 100,
+        },
+        {
+            key         = 'NPCQuickCastTouchTargetChance',
+            name        = 'In Touch Reach: Target Spell Weight (0-100%)',
+            description = 'Favor of Target spells when the enemy is already within touch reach. 0 disables point-blank projectiles unless nothing else is available.',
+            renderer    = 'number',
+            default     = 20,
+            min         = 0,
+            max         = 100,
+        },
+        {
             key         = 'NPCQuickCastCooldownMin',
-            name        = 'Minimum Cooldown (seconds)',
+            name        = 'Minimum Quickcast Cooldown (seconds)',
             description = 'Minimum delay between quick-casts by the same NPC.',
             renderer    = 'number',
-            default     = 3.5,
+            default     = 2.2,
             min         = 1.0,
             max         = 60.0,
         },
         {
             key         = 'NPCQuickCastCooldownMax',
-            name        = 'Maximum Cooldown (seconds)',
-            description = 'Maximum delay between consecutive quick-casts by the same NPC.',
+            name        = 'Maximum Quickcast Cooldown (seconds)',
+            description = 'Maximum delay between consecutive quick-casts by the same NPC. Does not apply to Self buffs — they are cast on a fixed 2.2-second rhythm.',
             renderer    = 'number',
-            default     = 8.5,
+            default     = 4,
             min         = 1.5,
             max         = 60.0,
+        },
+        {
+            key         = 'NPCMercyVanillaCastWindow',
+            name        = 'Mercy CAO: Vanilla Cast Window (seconds)',
+            description = 'Only applies with Mercy CAO installed.',
+            renderer    = 'number',
+            default     = 5.0,
+            min         = 0,
+            max         = 30.0,
+        },
+        {
+            key         = 'NPCMercyQuickcastWindowCooldown',
+            name        = 'Mercy CAO: Quick-cast Window Cooldown (seconds)',
+            description = 'Only applies with Mercy CAO installed.',
+            renderer    = 'number',
+            default     = 5.0,
+            min         = 0.5,
+            max         = 30.0,
+        },
+        {
+            key         = 'NPCVanillaCastsAllowedMin',
+            name        = 'Vanilla Casts Allowed After AI Takeover — Minimum',
+            description = 'Only applies with Mercy CAO installed. Decide how much minimum casts Mercy in its cast window will be allowed to do by OSSC.',
+            renderer    = 'number',
+            default     = 1,
+            min         = 0,
+            max         = 10,
+        },
+        {
+            key         = 'NPCVanillaCastsAllowedMax',
+            name        = 'Vanilla Casts Allowed After AI Takeover — Maximum',
+            description = 'Only applies with Mercy CAO installed. Decide how much maximum casts Mercy in its cast window will be allowed to do by OSSC.\nSet both numbers to same value and it will not randomise it.',
+            renderer    = 'number',
+            default     = 2,
+            min         = 0,
+            max         = 10,
+        },
+        {
+            key         = 'NPCVanillaCastAllowanceTimeout',
+            name        = 'Vanilla Cast Allowance Timeout (seconds)',
+            description = 'Only applies with Mercy CAO installed. How long the Mercy window should be allowed without it casting a spell, after timeout OSSC takes over.',
+            renderer    = 'number',
+            default     = 5.0,
+            min         = 0,
+            max         = 60.0,
+        },
+        {
+            key         = 'NPCProjectilesPassThroughBystanders',
+            name        = 'Projectiles Pass Through Unintended Targets',
+            description = 'On by default for vanilla parity.',
+            renderer    = 'checkbox',
+            default     = true,
+        },
+        {
+            key         = 'NPCAIWeaknessMinMagnitude',
+            name        = 'Minimum Weakness Magnitude (%)',
+            description = 'Minimum Weakness Magnitude % for an actor to consider quickcasting it in a combo chain. 0 disables the check.',
+            renderer    = 'number',
+            default     = 15,
+            argument    = { min = 0, max = 100, integer = true },
+        },
+        {
+            key         = 'NPCAIBeneficialBuffMinDuration',
+            name        = 'Minimum Beneficial Buff Duration (seconds)',
+            description = 'Minimum Buff spell duration for an actor to consider quickcasting it. 0 disables the check.',
+            renderer    = 'number',
+            default     = 15,
+            argument    = { min = 0, max = 600, integer = true },
+        },
+        {
+            key         = 'NPCAIReactions',
+            name        = 'Reactions',
+            description = 'Low Health: below the heal threshold the actor casts a known escape spell (Invisibility or Chameleon) if it has one, ahead of its other spells and regardless of the quick-cast cooldown or hit chance. \nBroad: the same as low health, plus a known protective Self spell (Sanctuary, Shield, Reflect, Spell Absorption, invisibility or chameleon) whenever an incoming hit lands.\n Off disables both.',
+            renderer    = 'select',
+            argument    = { l10n = 'OSSC', items = { 'Off', 'LowHealth', 'Broad' } },
+            default     = 'LowHealth',
+        },
+        {
+            key         = 'NPCAIAllyCasting',
+            name        = 'Ally Casting',
+            description = 'UNTESTED. USE FAIR CARE MOD.',
+            renderer    = 'select',
+            argument    = { l10n = 'OSSC', items = { 'Off', 'Cheap', 'Moderate', 'Rich' } },
+            default     = 'Off',
+        },
+        {
+            key         = 'NPCAIBuffRecastCooldown',
+            name        = 'Same Buff Recast Cooldown (seconds)',
+            description = 'Minimum time before an NPC or creature can quick-cast the same buff spell again (prevents overcasting shorter buffs). 0 disables the lock.',
+            renderer    = 'number',
+            default     = 30,
+            argument    = { min = 0, max = 600, integer = true },
+        },
+        {
+            key         = 'NPCAIMagickaReserve',
+            name        = 'Magicka Reserve (%)',
+            description = 'Actors that know a heal or restore fatigue spell keep this share of max magicka as headroom (offensive spells stop below it). 0 disables.',
+            renderer    = 'number',
+            default     = 25,
+            argument    = { min = 0, max = 90, integer = true },
+        },
+        {
+            key         = 'NPCAIDeclinedSpells',
+            name        = 'Declined Spells (comma-separated ids)',
+            description = 'Additional Spell record ids actors must never quick-cast.',
+            renderer    = 'textLine',
+            default     = '',
+        },
+        {
+            key         = 'NPCAIDecisionTrace',
+            name        = 'NPC Spell Decision Debug Logging',
+            renderer    = 'checkbox',
+            default     = false,
         },
     }
 })
@@ -595,7 +782,7 @@ local function animEntry(key, name, description, default)
     }
 end
 
-I.Settings.registerGroup({
+registerGroup({
     key              = 'SettingsOSSC_Animations',
     page             = 'OSSCPage',
     l10n             = 'OSSC',
@@ -616,6 +803,8 @@ I.Settings.registerGroup({
 
         animEntry('Anim_Alteration_Self_1st',    'Alteration – Self (1st person)',    'Animation for Alteration self-range spells in first person.',    'qcsnap'),
         animEntry('Anim_Alteration_Self_3rd',    'Alteration – Self (3rd person)',    'Animation for Alteration self-range spells in third person.',    'qcsnap'),
+        animEntry('Anim_Alteration_Touch_1st',   'Alteration – Touch (1st person)',   'Animation for Alteration touch-range spells in first person.',   'qctouch'),
+        animEntry('Anim_Alteration_Touch_3rd',   'Alteration – Touch (3rd person)',   'Animation for Alteration touch-range spells in third person.',   'qctouch'),
         animEntry('Anim_Alteration_Target_1st',  'Alteration – Target (1st person)',  'Animation for Alteration target-range spells in first person.',  'qcalt'),
         animEntry('Anim_Alteration_Target_3rd',  'Alteration – Target (3rd person)',  'Animation for Alteration target-range spells in third person.',  'qcalt'),
 
@@ -657,7 +846,7 @@ I.Settings.registerGroup({
 })
 
 -- ── Group 4: Animation Speeds ─────────────────────────────────────────
-I.Settings.registerGroup({
+registerGroup({
     key              = 'SettingsOSSC_AnimSpeeds',
     page             = 'OSSCPage',
     l10n             = 'OSSC',

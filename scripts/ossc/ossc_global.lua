@@ -1,8 +1,7 @@
 ---@omw-context global
 -- ============================================================
--- OSSC: Oblivion-Style Spell Casting
--- ossc_global.lua (GLOBAL script)
--- Handles authoritative item/charge consumption & actor script attachment.
+-- OSSC: Oblivion-Style Spell Casting - global script
+-- Item/charge consumption and actor script attachment.
 -- ============================================================
 local core    = require('openmw.core')
 local types   = require('openmw.types')
@@ -11,24 +10,24 @@ local vfs     = require('openmw.vfs')
 local I       = require('openmw.interfaces')
 local util    = require('openmw.util')
 local world   = require('openmw.world')
+-- Placement of a spell's hit statics (see the module: vanilla draws them
+-- at the impact point, SF+ attaches them at the actor's feet).
+local impactVfx = require('scripts.ossc.ossc_impact_vfx')
+-- The blast rules every caster shares (ossc_cast_rules re-exports the
+-- same two functions) and the one measurement of an actor's middle.
+-- Both need only global packages, which is why they can be loaded here.
+local spellArea  = require('scripts.ossc.ossc_spell_area')
+local bodyAnchor = require('scripts.ossc.ossc_body_anchor')
 
 local SCRIPT_NPC      = 'scripts/ossc/ossc_npc.lua'
 local SCRIPT_CREATURE = 'scripts/ossc/ossc_creature.lua'
 local SCRIPT_ITEMS    = 'scripts/ossc/ossc_actor_items.lua'
 
--- Settings sync: OSSC's settings groups are PLAYER settings (registered from
--- the player script's settings page). Global scripts and local actor scripts
--- cannot read player storage — storage.playerSection is only available to
--- player/menu scripts — so reading the menu values here always returned the
--- hardcoded defaults (e.g. NPCQuickCastCreatures could never be turned off).
--- The player script therefore mirrors every relevant group into GLOBAL storage
--- (same section names) via the OSSC_SyncSettings event, on load and whenever a
--- setting changes. Actor scripts and this script then read the mirror through
--- globalSection(), which is visible everywhere. SettingsOSSC_Keys is included
--- so EnablePlayerSwirls / EnableHandSwirls / EnableCastGlow also gate NPC and
--- eligible-creature cast VFX (those scripts cannot read player storage).
+-- Settings mirror: player storage is unreadable here; read the global copy sent via OSSC_SyncSettings.
 local SYNCED_SETTING_GROUPS = {
     ['SettingsOSSC_General']     = true,
+    -- SettingsOSSC_NPC_AI is gone: the decision settings are part of the
+    -- SettingsOSSC_NPC group now.
     ['SettingsOSSC_NPC']         = true,
     ['SettingsOSSC_Animations']  = true,
     ['SettingsOSSC_AnimSpeeds']  = true,
@@ -49,13 +48,8 @@ local function debugModeEnabled()
     return generalSettings:get('DebugMode') == true
 end
 
--- ── Spell classification ───────────────────────────────────────────────────
--- Shared with the actor scripts through scripts/ossc/ossc_caster_utils.lua.
--- That helper is newer than the rest of the mod, and a partial/older install
--- (or an OpenMW session whose file index was built before the file appeared,
--- e.g. after an in-game `reloadlua`) must not stop the GLOBAL script from
--- starting: `require` of a missing data file throws. Check the VFS first and
--- fall back to an equivalent built-in classifier with a warning.
+-- ── Spell classification ──
+-- require of a missing file throws: probe the VFS and fall back to the built-in classifier.
 local CASTER_UTILS_FILE   = 'scripts/ossc/ossc_caster_utils.lua'
 local CASTER_UTILS_MODULE = 'scripts.ossc.ossc_caster_utils'
 
@@ -69,9 +63,19 @@ local function builtinHasCastableSpell(actor, allowPowers)
     local knownSpells = types.Actor.spells(actor)
     if not knownSpells then return false end
     local spellRecords = core.magic.spells.records
-    for _, knownSpell in pairs(knownSpells) do
-        local spellId = knownSpell
-        if type(knownSpell) ~= 'string' then spellId = knownSpell.id end
+    local function spellIdFromEntry(key, value)
+        if type(value) == 'string' then return value end
+        -- No pcall: a raising `id` read is an engine-binding error and must
+        -- surface instead of making the actor look spell-less.
+        if type(value) == 'table' or type(value) == 'userdata' then
+            local id = value.id
+            if type(id) == 'string' then return id end
+        end
+        if type(key) == 'string' then return key end
+        return nil
+    end
+    for key, knownSpell in pairs(knownSpells) do
+        local spellId = spellIdFromEntry(key, knownSpell)
         if spellId and builtinIsCastableSpellRecord(spellRecords[spellId], allowPowers) then return true end
     end
     return false
@@ -89,10 +93,7 @@ else
     }
 end
 
--- Built-in NPC-settings reader: the schema lives in ossc_caster_utils.lua, but
--- a partial/older install (or a pre-update file index, e.g. after an in-game
--- `reloadlua`) may lack it — the defaults below mirror ossc_settings.lua so
--- I.OSSC_Casters.getNPCSettings keeps answering even then.
+-- Built-in NPC-settings fallback; defaults mirror ossc_settings.lua.
 local builtinNPCSettingsDefaults = {
     NPCQuickCastEnabled           = true,
     NPCQuickCastCreatures         = true,
@@ -105,8 +106,21 @@ local builtinNPCSettingsDefaults = {
     NPCQuickCastMinDistance       = 500,
     NPCQuickCastMaxDistance       = 700,
     NPCQuickCastHealThreshold     = 40,
+    NPCQuickCastTouchChance       = 60,
+    NPCQuickCastTouchTargetChance = 10,
     NPCQuickCastCooldownMin       = 3.5,
     NPCQuickCastCooldownMax       = 8.5,
+    NPCMercyVanillaCastWindow      = 5.0,
+    NPCMercyQuickcastWindow        = true,
+    NPCMercyQuickcastWindowCooldown = 2.0,
+    NPCQuickCastEquipReadiness      = 1.5,
+    NPCVanillaCastUnequipTimeout    = 5.0,
+    NPCVanillaCastsAllowedMin       = 1,
+    NPCVanillaCastsAllowedMax       = 2,
+    NPCVanillaCastAllowanceTimeout  = 6.0,
+    NPCVanillaCastAllowanceReadiness = 1.5,
+    NPCProjectilesPassThroughBystanders = true,
+    NPCPauseResumeGrace            = 2.0,
 }
 local function builtinReadNPCSettings(section)
     local values = {}
@@ -146,18 +160,14 @@ local function isBipedCreature(actor)
     return record ~= nil and record.isBiped == true
 end
 
--- A caster script deliberately removes regular castable spells from the
--- engine-facing spell list while it is active. Spell presence is therefore
--- only an eligibility check when a combat event asks us to attach a script;
--- it is never used to discover combatants.
+-- Caster scripts hide castable spells while attached: spell presence is an eligibility check only, never combat discovery.
 local function isCasterEligible(actor, alreadyManaged)
     if actor.type == types.Player or types.Actor.isDead(actor) then return false end
     if not settingOr(npcSettings, 'NPCQuickCastEnabled', true) then return false end
 
     if actor.type == types.Creature then
         if not settingOr(npcSettings, 'NPCQuickCastCreatures', true) then return false end
-        -- Non-biped creatures have their own toggle so quick-casting can be
-        -- restricted to biped creatures without disabling biped casters.
+        -- Non-biped creatures have their own toggle.
         if not settingOr(npcSettings, 'NPCQuickCastNonBipedCreatures', true) and not isBipedCreature(actor) then
             return false
         end
@@ -165,10 +175,7 @@ local function isCasterEligible(actor, alreadyManaged)
         return false
     end
 
-    -- Once attached, the caster script intentionally hides regular spells
-    -- from Actor.spells so vanilla AI cannot cast them in parallel. Keep that
-    -- already-verified actor eligible across later combat-target-change events
-    -- instead of mistaking OSSC's own temporary removal for "has no spells".
+    -- Attached caster hides its spells; stay eligible across later combat events.
     if alreadyManaged then return true end
 
     local allowPowers = settingOr(npcSettings, 'NPCQuickCastAllowPowers', false)
@@ -176,16 +183,8 @@ local function isCasterEligible(actor, alreadyManaged)
     return hasCastOnUseItem(actor)
 end
 
--- Biped creatures remain eligible as before. For a non-biped creature,
--- inspect its live Actor spell list instead of guessing from its model: at
--- least one regular Spell (or a Power when that setting is enabled) makes it
--- eligible, and only while the dedicated non-biped toggle
--- (NPCQuickCastNonBipedCreatures) is enabled. Abilities, diseases and other
--- passive spell-list entries do not. This automatically covers mod-added
--- spellcasters too. An already-managed actor remains provisionally eligible
--- because its caster script hides those spells while attached
--- (isCasterEligible still applies the enabled/dead/type settings before
--- accepting it).
+-- Non-biped creatures qualify only via a castable Spell (or Power if enabled) in Actor.spells; Abilities never do.
+-- Already-managed actors stay eligible (their spells are hidden).
 local function isEligibleCreatureBody(actor, alreadyManaged)
     if isBipedCreature(actor) then return true end
     if not settingOr(npcSettings, 'NPCQuickCastNonBipedCreatures', true) then return false end
@@ -210,23 +209,106 @@ local function detachScript(actor, path)
     end
 end
 
--- ── Caster pause route ─────────────────────────────────────────────────────
--- A pause is owned by the actor's own local script (I.OSSC_Caster in
--- ossc_npc.lua / ossc_creature.lua): it is the only scope that can stop the
--- cast, hand the engine's spell list back and keep the animation state honest.
--- A global script cannot reach a local interface, so this is the request route
--- plus a best-effort mirror of what was requested through it.
+-- ── Spell Framework Plus hit VFX on a non-player target ────────────────────
+-- SFP renders a spell's per-effect hit static by sending an `AddVfx` event to
+-- the TARGET's own local script, which is a CUSTOM script: it is only attached
+-- on demand, and only a GLOBAL script may attach one. SFP's launch path attaches
+-- its own handler to the CASTER, never to the target, and for a plain
+-- (non-persistent) effect it does not attach it at all — which is why an
+-- actor's quick-cast at the Player looked right (the Player has the handler in
+-- SFP's player script) while the player's quick-cast at an actor showed no VFX
+-- on impact at all: the event went to an actor with nothing to interpret it.
 --
--- The request also attaches the caster script to an actor that does not have
--- it.  That is deliberate and it is not "guessing combat": a mod asking for a
--- pause is an explicit request, and a pause that only worked while the actor
--- was already fighting would be useless for scripted scenes.  The janitor only
--- manages actors it saw combat events for, so an on-demand attach is not
--- detached behind the caller's back - but leaving and re-entering a cell
--- (onActorActive) still resets it, like every other OSSC attach.
--- Keyed by actor id, not by the object: two Lua references to the same actor
--- are two different table keys, and a pause asked through one of them has to be
--- visible through the other.
+-- OSSC's caster scripts therefore hand their intended target here, before the
+-- launch, and this side attaches a handler. It attaches OSSC's own
+-- (scripts/ossc/ossc_actor_hit_vfx.lua) rather than SFP's, because SFP's anchors
+-- the effect to the actor's node — the ground at its FEET — while a hit has to
+-- bloom on the body the bolt was aimed at. The interface check keeps the whole
+-- thing inert when SFP is not installed (only SFP's own global script registers
+-- I.MagExp, and only its manifest registers the scripts that read these events).
+local ACTOR_HIT_VFX_SCRIPT  = 'scripts/ossc/ossc_actor_hit_vfx.lua'
+local SFP_ACTOR_VFX_SCRIPT  = 'scripts/OMW_MagExp/magexp_actor_vfx.lua'
+
+-- Whether the engine knows the OSSC handler at all: nil until asked, then true
+-- or false for the rest of the session.
+--
+-- `addScript` RAISES "Unknown script: <path>" for a path that is not in the
+-- scripts configuration, and that configuration only comes from an
+-- `.omwscripts` file read at startup (components/lua/configuration.cpp,
+-- parseOMWScripts). There is no way to ask first: `Object:hasScript` returns
+-- false both for a known-but-unattached script and for a path nobody
+-- registered, so the only way to learn the answer is to try once.
+--
+-- Hence one guarded attempt, cached, and — crucially — REPORTED instead of
+-- swallowed: a target whose handler cannot be attached is left with something
+-- that can draw hit VFX (SFP's own handler) and the player is told, in plain
+-- words, which file is out of date. That beats an exception on every hit, which
+-- is what an unguarded `addScript` used to produce.
+local hitVfxScriptRegistered = nil
+
+-- The one failure worth recovering from is the engine not knowing the path at
+-- all. Anything else (an invalid object, a real engine refusal) is a bug and is
+-- re-raised untouched instead of being misreported as a stale install.
+local function isUnknownScriptError(err)
+    return type(err) == 'string' and err:find('Unknown script', 1, true) ~= nil
+end
+
+local function ensureHitVfxHandler(actor)
+    if not (actor and actor.isValid and actor:isValid()) then return false end
+    local actorType = actor.type
+    if actorType ~= types.NPC and actorType ~= types.Creature then return false end
+    if types.Actor.isDead(actor) then return false end
+    if not (I and I.MagExp) then return false end
+
+    if hitVfxScriptRegistered == nil then
+        local ok, err = pcall(attachScript, actor, ACTOR_HIT_VFX_SCRIPT)
+        if not ok and not isUnknownScriptError(err) then error(err, 0) end
+        hitVfxScriptRegistered = ok
+        if not ok then
+            print('[OSSC Global] ' .. ACTOR_HIT_VFX_SCRIPT .. ' is not registered with the engine, so'
+                .. ' hit VFX cannot be anchored to the body. The engine registers CUSTOM scripts when'
+                .. ' it starts, from the .omwscripts content file: the running install of'
+                .. ' "Oblivion Style Spell Casting OSSC.omwscripts" is older than the scripts and does'
+                .. ' not list "CUSTOM: ' .. ACTOR_HIT_VFX_SCRIPT .. '". Update that file (it ships'
+                .. ' with these scripts) and restart the game. Impact statics are unaffected — OSSC'
+                .. ' draws those itself at the hit point — but a looping/persistent effect (shield'
+                .. ' and friends) stays at the actor\'s feet until the file is updated.')
+        end
+    elseif hitVfxScriptRegistered then
+        attachScript(actor, ACTOR_HIT_VFX_SCRIPT)
+    end
+
+    if hitVfxScriptRegistered then
+        -- One interpreter per actor: OSSC's copy reads the same AddVfx /
+        -- RemoveVfx protocol but lifts the effect to the body, so SFP's
+        -- feet-anchored copy is removed (leaving both would add every
+        -- non-looping hit effect twice). Only reached once OSSC's handler is
+        -- known to be attachable — the old order removed SFP's first and then
+        -- died on the addScript, leaving the actor with no handler at all.
+        detachScript(actor, SFP_ACTOR_VFX_SCRIPT)
+    else
+        -- Fallback: keep hit VFX working at all (SFP's placement) instead of
+        -- leaving the actor unable to interpret the events.
+        attachScript(actor, SFP_ACTOR_VFX_SCRIPT)
+    end
+    return hitVfxScriptRegistered
+end
+
+-- Which local script on `actor` interprets Spell Framework Plus' per-effect
+-- `AddVfx`, or nil when it has none yet. OSSC's copy and SFP's own are the
+-- same pass-through (`anim.addVfx(self, model, options)`), so either is a
+-- valid target for a hit static; what must never happen is BOTH being
+-- attached, which is why ensureHitVfxHandler removes SFP's when it adds
+-- OSSC's.
+local function hitVfxHandlerOf(actor)
+    if actor:hasScript(ACTOR_HIT_VFX_SCRIPT) then return ACTOR_HIT_VFX_SCRIPT end
+    if actor:hasScript(SFP_ACTOR_VFX_SCRIPT) then return SFP_ACTOR_VFX_SCRIPT end
+    return nil
+end
+
+-- ── Caster pause route ──
+-- The actor's local script owns the pause; this forwards requests and mirrors them.
+-- A pause request attaches the caster script on demand. Keyed by actor.id, not object.
 local actorPauseRequests = {}   -- [actor.id] = { actor = actor, reasons = { [reason] = true } }
 
 local function casterScriptFor(actor)
@@ -236,9 +318,7 @@ local function casterScriptFor(actor)
     return nil
 end
 
---- Forward one pause/unpause request to the actor's own caster script.  The
---- actor keeps the authoritative state; this only remembers what was requested
---- through this route.  Returns false when OSSC does not manage the actor.
+-- Forward a pause request to the actor's caster script. False when OSSC does not manage the actor.
 local function setActorPaused(actor, paused, reason)
     local path = casterScriptFor(actor)
     if not path then return false end
@@ -318,7 +398,9 @@ local function loadIgnoredSpells()
     if ignoredSpellsLoaded then return end
     ignoredSpellsLoaded = true
     local stored = spellFilterSection:get(SPELL_FILTER_KEY)
-    if type(stored) ~= 'table' then return end
+    if stored == nil then return end
+    -- OpenMW storage returns serialized arrays as userdata proxies, not Lua
+    -- tables. ipairs works with the proxy's indexed access metamethod.
     for _, spellId in ipairs(stored) do
         local key = normalizeSpellKey(spellId)
         if key then ignoredSpells[key] = true end
@@ -326,9 +408,7 @@ local function loadIgnoredSpells()
     ignoredSpellIds = ignoredSpellList()
 end
 
--- Defined after combatActors (the broadcast walks the managed actors), so the
--- variable is declared here and assigned below; every closure below captures
--- this one slot and sees the assignment by the time it can be called.
+-- Declared here, assigned after combatActors.
 local broadcastIgnoredSpells
 
 local function isSpellIgnored(spellId)
@@ -369,24 +449,9 @@ local function setIgnoredSpells(list)
     return true, true
 end
 
--- ── On-demand casts ───────────────────────────────────────────────────────
--- `castSpellAtTarget` takes the caster as an argument, so a mod can order a
--- cast for any actor it can see - the player included:
---
---   I.OSSC_Casters.castSpellAtTarget({
---       caster    = actor,            -- required, an actor (NPC/creature/player)
---       spellId   = 'my_spell',       -- required, a spell record id
---       target    = otherActor,       -- optional: actor, or a util.vector3
---       effectScale = 0.5,            -- optional: quick-cast penalty (default 1)
---       isFree    = true,             -- optional: the mod already paid the cost
---       userData  = { MyMod = true }, -- optional: forwarded to MagExp
---   })
---
--- Only the request is made here; the cast itself runs through Spell Framework
--- Plus (MagExp_CastRequest), exactly like OSSC's own quick-casts, so every
--- downstream effect-penalty mechanic applies.  The player's own OSSC script is
--- preferred when it is installed: it knows the player's quick-cast penalty
--- settings and the stance/aim details, so the cast matches a hotkey cast.
+-- ── On-demand casts ──
+-- castSpellAtTarget({ caster, spellId, target?, effectScale?, isFree?, userData? }) via MagExp_CastRequest.
+-- Player casts are routed to the player script.
 local function isTargetObject(value)
     local kind = type(value)
     if kind ~= 'userdata' and kind ~= 'table' then return false end
@@ -397,7 +462,11 @@ local function resolveAimPoint(target)
     if target == nil then return nil, nil end
     if isTargetObject(target) then
         if not (target.isValid and target:isValid()) then return nil, nil end
-        return target.position + util.vector3(0, 0, 60), target
+        -- The middle of the body, measured the way every OSSC caster measures it
+        -- (ossc_body_anchor: the box CENTRE, clamped into the torso band). It
+        -- used to be a flat +60, which is not any actor's middle: a short
+        -- creature was aimed over its head and a tall one under the chest.
+        return bodyAnchor.point(target) or target.position, target
     end
     if target.x ~= nil and target.y ~= nil and target.z ~= nil then
         return target, nil
@@ -405,10 +474,7 @@ local function resolveAimPoint(target)
     return nil, nil
 end
 
---- The copy of a request the global script sends itself, for an actor that has
---- no OSSC script of its own.  `isFree = false` unless the caller says
---- otherwise: Spell Framework Plus then charges the caster at launch, which is
---- the only place an item charge can be spent anyway.
+-- Self-sent request for an actor with no OSSC script; isFree defaults false so SFP charges at launch.
 local function sendCastRequest(caster, record, args)
     local startPos = args.startPos or caster.position or util.vector3(0, 0, 0)
     local aimPoint, hitObject = resolveAimPoint(args.target)
@@ -426,10 +492,20 @@ local function sendCastRequest(caster, record, args)
     if type(args.userData) == 'table' then
         for key, value in pairs(args.userData) do userData[key] = value end
     end
+    -- The bolt will land on `hitObject`: it has to be able to show SFP's hit
+    -- VFX (see ensureHitVfxHandler). Cheap and idempotent.
+    if hitObject then ensureHitVfxHandler(hitObject) end
     local range = record.effects and record.effects[1] and record.effects[1].range
+    -- The launch's `area` IS the bolt's blast radius as far as SFP is concerned
+    -- (`area = 0` is a plain bolt, not "read the record"), so it is resolved from
+    -- the record's TARGET-range effects — the same rule the player's and the
+    -- actor's quick-casts use. Reading `effects[1].area` was wrong for every
+    -- spell whose first effect is not the exploding one (the usual layout: a
+    -- Self or Touch rider in front of the blast), and those casts reached SFP
+    -- with `area = 0` and never exploded.
     local area = args.area
     if area == nil then
-        area = record.effects and record.effects[1] and record.effects[1].area or 0
+        area = spellArea.impactArea(record)
     end
     if range == core.magic.RANGE.Self then
         hitObject = caster
@@ -480,35 +556,30 @@ local function castSpellAtTarget(args)
     -- The player's own OSSC script knows the quick-cast penalty settings (and
     -- refuses a cast while the game is not accepting input); hand the request
     -- to it rather than building a second, differently-penalised cast here.
-    if types.Player.objectIsInstance(caster) and I.OSSC
-        and type(I.OSSC.castSpellAtTarget) == 'function' then
-        return I.OSSC.castSpellAtTarget(args)
+    if types.Player.objectIsInstance(caster) then
+        -- Local interfaces are not visible to a global script. Route through
+        -- the player's actor event handler so its settings and penalties are
+        -- applied by the owning player script.
+        caster:sendEvent('OSSC_ExternalCastRequest', args)
+        return true
     end
     return sendCastRequest(caster, record, args)
 end
 
 local OSSC_CastersInterface = {
     version = 1,
-    --- Pause/unpause a managed NPC/creature caster.  `reason` lets two mods
-    --- pause independently: unpausing one reason does not resume the actor for
-    --- the other.  `unpause(actor)` with no reason releases every pause.
+    -- Pause/unpause; reasons are independent. unpause(actor) with no reason releases all.
     pause     = function(actor, reason) return setActorPaused(actor, true, reason) end,
     unpause   = function(actor, reason) return setActorPaused(actor, false, reason) end,
     setPaused = function(actor, paused, reason)
         return setActorPaused(actor, paused == true, reason)
     end,
-    --- True when this route currently holds a pause for the actor.  The
-    --- authoritative state lives in the actor's own script (I.OSSC_Caster);
-    --- this is the request mirror a global script can see.
+    -- True when this route holds a pause (mirror only; actor script is authoritative).
     isPaused = function(actor) return actor ~= nil and actorPauseRequests[actor.id] ~= nil end,
-    --- The caster script an actor would use, so a mod can tell whether OSSC
-    --- manages it at all (and check hasScript before relying on the interface).
+    -- Caster script an actor would use; check hasScript before relying on the interface.
     casterScript = casterScriptFor,
 
-    -- ── Spell filter (see the block above) ─────────────────────────────────
-    -- A spell in this list is never *picked* by OSSC; an explicit hotkey cast
-    -- or I.OSSC_Casters.castSpellAtTarget still works.  Ids are stored
-    -- lowercased and survive a save/load.
+    -- ── Spell filter ──
     ignoreSpell        = function(spellId) return setSpellIgnored(spellId, true) end,
     unignoreSpell      = function(spellId) return setSpellIgnored(spellId, false) end,
     setSpellIgnored    = function(spellId, ignored) return setSpellIgnored(spellId, ignored) end,
@@ -531,7 +602,15 @@ local OSSC_CastersInterface = {
     --- player's configured distance into their own range logic instead of
     --- hardcoding the 500 default.
     getQuickCastFullChanceDistance = function()
-        return settingOr(npcSettings, 'NPCQuickCastMinDistance', 500)
+        -- Same clamp the actor scripts apply in refreshSettings: the menu
+        -- allows a Full Chance Distance larger than the Maximum Cast Distance,
+        -- and the roll then uses the Maximum as the end of the full-chance
+        -- band. Reporting the raw value here made this read-out disagree with
+        -- what the casters actually roll against.
+        local minDist = tonumber(settingOr(npcSettings, 'NPCQuickCastMinDistance', 500)) or 500
+        local maxDist = tonumber(settingOr(npcSettings, 'NPCQuickCastMaxDistance', 700)) or 700
+        if minDist > maxDist then minDist = maxDist end
+        return minDist
     end,
 
     --- Every NPC/creature quick-cast setting (the SettingsOSSC_NPC group) as
@@ -542,8 +621,17 @@ local OSSC_CastersInterface = {
     --- NPCQuickCastDebugLog, NPCQuickCastAllowPowers, NPCQuickCastRandomAnims,
     --- NPCQuickCastPollInterval, NPCQuickCastBaseChance,
     --- NPCQuickCastMinDistance, NPCQuickCastMaxDistance,
-    --- NPCQuickCastHealThreshold, NPCQuickCastCooldownMin and
-    --- NPCQuickCastCooldownMax.  The result is a fresh copy — safe to keep or
+    --- NPCQuickCastHealThreshold, NPCQuickCastTouchChance,
+    --- NPCQuickCastTouchTargetChance, NPCQuickCastCooldownMin,
+    --- NPCQuickCastCooldownMax, NPCMercyVanillaCastWindow,
+    --- NPCMercyQuickcastWindow, NPCMercyQuickcastWindowCooldown,
+    --- NPCMercyQuickcastWindowCooldown,
+    --- NPCQuickCastEquipReadiness,
+    --- NPCVanillaCastUnequipTimeout, NPCVanillaCastsAllowedMin,
+    --- NPCVanillaCastsAllowedMax, NPCVanillaCastAllowanceTimeout,
+    --- NPCVanillaCastAllowanceReadiness,
+    --- NPCProjectilesPassThroughBystanders and NPCPauseResumeGrace.
+    --- The result is a fresh copy — safe to keep or
     --- mutate.  getQuickCastFullChanceDistance() above is the convenience
     --- read-out of NPCQuickCastMinDistance.
     getNPCSettings = function()
@@ -554,7 +642,11 @@ local OSSC_CastersInterface = {
 -- OSSC must only exist on actors currently reported by OpenMW's combat-music
 -- tracker. Do not infer combat from spell lists: that both attaches scripts to
 -- idle actors and fails when an actor has no castable spell.
-local combatActors = {}
+-- Object handles received through different events need not be the same Lua
+-- userdata. Even when a == b, table keys do not use __eq. Key ALL lifecycle
+-- state by actor.id; otherwise an old onActorActive(false) entry can ask the
+-- janitor to suspend a fighting actor, and its detach acks never find it.
+local combatActors = {} -- [actor.id] = { actor, wanted, rawInCombat }
 
 --- Hand the current spell filter to everything that picks spells: every actor
 --- OSSC manages, and the player (whose script keeps a mirror so I.OSSC can
@@ -562,7 +654,8 @@ local combatActors = {}
 --- simply has no handler, which is why this is broadcast rather than acked.
 broadcastIgnoredSpells = function()
     local payload = { version = ignoredSpellVersion, ids = ignoredSpellList() }
-    for actor in pairs(combatActors) do
+    for _, state in pairs(combatActors) do
+        local actor = state.actor
         if actor and actor.isValid and actor:isValid() then
             actor:sendEvent('OSSC_SetIgnoredSpells', payload)
         end
@@ -573,14 +666,9 @@ broadcastIgnoredSpells = function()
         end
     end
 end
--- Raw last combat signal per actor (true = a combat event reported a live
--- target), preserved even when the eligibility gates below reject the actor.
--- combatActors doubles as "attachment wanted" state and is forced false on the
--- detach path, so it cannot answer "is this actor still fighting?" — the
--- janitor needs the raw signal to re-drive attach/detach when a menu toggle
--- flips mid-combat (see runJanitor). Only combat events, cell activation
--- (no combat info — clears it) and death (ends combat — clears it) write it.
-local rawCombatActors = {}
+-- rawInCombat preserves the last combat signal even when settings reject the
+-- actor. wanted is the gated attachment state; the janitor compares the raw
+-- signal with current settings so toggles work without another combat event.
 
 -- ── Safe detach protocol ───────────────────────────────────────────────────
 -- Removing an actor script while its unsavable cast timers are still pending
@@ -611,7 +699,8 @@ end
 local function requestDetach(actor, paths)
     -- Supersedes any previous detach request.
     actor:sendEvent('OSSC_CombatEnded')
-    pendingDetach[actor] = {
+    pendingDetach[actor.id] = {
+        actor = actor,
         scripts = paths,
         acked = {},
         deadline = core.getSimulationTime() + DETACH_TIMEOUT,
@@ -621,14 +710,14 @@ end
 local function onReadyToDetach(data)
     local actor = data and data.actor
     if not actor or not actor:isValid() then return end
-    local entry = pendingDetach[actor]
+    local entry = pendingDetach[actor.id]
     if not entry then return end
     if data.script then entry.acked[tostring(data.script)] = true end
     for _, path in ipairs(entry.scripts) do
         if not entry.acked[path] then return end                -- still waiting
     end
-    pendingDetach[actor] = nil
-    if combatActors[actor] == true then return end
+    pendingDetach[actor.id] = nil
+    if combatActors[actor.id] and combatActors[actor.id].wanted then return end
     detachScriptsNow(actor, entry.scripts)
 end
 
@@ -636,9 +725,9 @@ local function setCombatScripts(actor, inCombat)
     if not actor or not actor:isValid() or actor.type == types.Player then return end
 
     -- Capture the raw combat signal before any gating below: the janitor
-    -- compares it against live eligibility, so eligibility rejects (dead,
-    -- creature body) must never erase it.
-    local rawInCombat = inCombat == true
+    -- compares it against live eligibility, so settings/body rejects must
+    -- never erase it. Death, unlike a settings reject, really ends combat.
+    local rawInCombat = inCombat == true and not types.Actor.isDead(actor)
 
     -- A dead actor is never in combat: force the detach path so its scripts
     -- are removed promptly instead of idling on a corpse until the cell
@@ -652,17 +741,15 @@ local function setCombatScripts(actor, inCombat)
     if inCombat and actor.type == types.Creature and not isEligibleCreatureBody(actor, alreadyManaged) then
         inCombat = false
     end
-    -- NOTE: only the raw event truth feeds rawCombatActors here. The detach
-    -- path below forces combatActors[actor] = false for eligibility rejects
-    -- too, but must NOT clear the raw signal: the actor is still fighting, and
-    -- the janitor re-attaches it if the toggle is flipped back on.
-    rawCombatActors[actor] = rawInCombat
-    combatActors[actor] = inCombat == true
+    -- Replace the previous handle's state, rather than leaving an older
+    -- activation/target-change entry for the janitor to act on later.
+    local state = { actor = actor, rawInCombat = rawInCombat, wanted = inCombat == true }
+    combatActors[actor.id] = state
 
     if inCombat and isCasterEligible(actor, alreadyManaged) then
         -- Combat resumed: cancel any pending detach and tell already-attached
         -- scripts that they may cast again.
-        pendingDetach[actor] = nil
+        pendingDetach[actor.id] = nil
         local attachedAny = actor:hasScript(SCRIPT_ITEMS) or alreadyManaged
         -- The item script snapshots creature eligibility at startup. Attach it
         -- before the caster script, whose onInit deliberately removes castable
@@ -675,7 +762,7 @@ local function setCombatScripts(actor, inCombat)
 
     -- Settings may have been changed while the actor was fighting; treat that
     -- exactly like leaving combat so temporary spell-list changes are undone.
-    combatActors[actor] = false
+    state.wanted = false
 
     local attached = nil
     if actor:hasScript(SCRIPT_ITEMS) then attached = { SCRIPT_ITEMS } end
@@ -687,7 +774,7 @@ local function setCombatScripts(actor, inCombat)
         end
     end
     if not attached then
-        pendingDetach[actor] = nil
+        pendingDetach[actor.id] = nil
         return
     end
     requestDetach(actor, attached)
@@ -746,12 +833,14 @@ end
 -- without bound.
 local function runJanitor()
     local now = core.getSimulationTime()
-    for actor, entry in pairs(pendingDetach) do
+    for id, entry in pairs(pendingDetach) do
+        local actor = entry.actor
         if not actor:isValid() then
-            pendingDetach[actor] = nil
+            pendingDetach[id] = nil
         elseif now >= entry.deadline then
-            pendingDetach[actor] = nil
-            if combatActors[actor] ~= true then detachScriptsNow(actor, entry.scripts) end
+            pendingDetach[id] = nil
+            local state = combatActors[id]
+            if not (state and state.wanted) then detachScriptsNow(actor, entry.scripts) end
         end
     end
     for id, journal in pairs(actorPauseRequests) do
@@ -760,10 +849,11 @@ local function runJanitor()
             actorPauseRequests[id] = nil
         end
     end
-    for actor, inCombat in pairs(combatActors) do
+    for id, state in pairs(combatActors) do
+        local actor = state.actor
         if not actor:isValid() then
-            combatActors[actor] = nil
-        elseif inCombat and types.Actor.isDead(actor) then
+            combatActors[id] = nil
+        elseif state.wanted and types.Actor.isDead(actor) then
             -- Death ends combat: run the normal safe-detach protocol so the
             -- dead actor's scripts ack (dead actors can never cast again)
             -- and are removed instead of running for the rest of the session.
@@ -777,20 +867,19 @@ local function runJanitor()
     -- attachment state disagrees with its current eligibility. Actors with a
     -- detach already in flight are skipped — their ack/timeout path owns them
     -- — and the steady state is a silent no-op, so this never spams events.
-    for actor, rawInCombat in pairs(rawCombatActors) do
-        if not actor:isValid() then
-            rawCombatActors[actor] = nil
-        elseif actor.type ~= types.NPC and actor.type ~= types.Creature then
-            rawCombatActors[actor] = nil
-        elseif pendingDetach[actor] == nil and not types.Actor.isDead(actor) then
+    for id, state in pairs(combatActors) do
+        local actor = state.actor
+        if not actor:isValid() or (actor.type ~= types.NPC and actor.type ~= types.Creature) then
+            combatActors[id] = nil
+        elseif pendingDetach[id] == nil and not types.Actor.isDead(actor) then
             local casterScript = actor.type == types.Creature and SCRIPT_CREATURE or SCRIPT_NPC
             local alreadyManaged = actor:hasScript(casterScript)
             local attached = alreadyManaged or actor:hasScript(SCRIPT_ITEMS)
-            local shouldAttach = rawInCombat == true
+            local shouldAttach = state.rawInCombat == true
                 and isCasterEligible(actor, alreadyManaged)
                 and (actor.type ~= types.Creature or isEligibleCreatureBody(actor, alreadyManaged))
             if shouldAttach ~= attached then
-                setCombatScripts(actor, rawInCombat == true)
+                setCombatScripts(actor, state.rawInCombat == true)
             end
         end
     end
@@ -810,9 +899,7 @@ local function onSyncSettings(data)
     storage.globalSection(data.group):reset(data.values or NO_VALUES)
 end
 
--- Fallback teleport handler for PMM multi-mark Recall. PMM's own global
--- script handles 'PMM_loadLoc'; this duplicate handler ensures the recall
--- works even when PMM's global script is absent or disabled.
+-- Fallback PMM multi-mark Recall teleport (when PMM's global script is absent).
 local teleportOptions = { rotation = nil }
 
 local function onPMMTeleport(data)
@@ -821,8 +908,7 @@ local function onPMMTeleport(data)
     local location = data[2]
     if not actor:isValid() or not location.position then return end
     teleportOptions.rotation = location.rotation
-    -- An empty cell name selects the default exterior worldspace; the
-    -- position picks the grid cell.
+    -- Empty cell name = default exterior.
     actor:teleport(location.cell or '', location.position, teleportOptions)
 end
 
@@ -844,8 +930,7 @@ local function getEffectiveCost(baseCost, actor)
     return math.max(1, math.floor(0.01 * (110 - skill) * baseCost))
 end
 
--- One successful enchanted-item quickcast consumes charges using the same
--- Enchant-skill formula as OSSC's player implementation.
+-- Enchanted-item charge consumption (same Enchant formula as the player).
 local function onConsumeCharge(data)
     if not (data and data.item and data.cost and data.actor) then
         print('[OSSC] ConsumeCharge: Missing data')
@@ -862,9 +947,7 @@ local function onConsumeCharge(data)
 end
 
 return {
-    -- Global route to the caster pause: a global script cannot see the actor's
-    -- local interface, so it pauses with `I.OSSC_Casters.pause(actor, reason)`.
-    -- Local scripts on the actor use I.OSSC_Caster instead (see ossc_npc.lua).
+    -- Global pause route; local scripts use I.OSSC_Caster.
     interfaceName = 'OSSC_Casters',
     interface = OSSC_CastersInterface,
     engineHandlers = {
@@ -875,22 +958,14 @@ return {
         OSSC_CombatTargetsChanged = onCombatTargetsChanged,
         -- NGarde's combat-target-changed global event (see onNGardeCombatTargetChanged).
         ngarde_combatTargetChanged = onNGardeCombatTargetChanged,
-        -- Player-settings mirror (sent by ossc_settings.lua on load and on
-        -- every settings change). Makes the NPC/creature menu options actually
-        -- reach the global and actor scripts.
+        -- Player-settings mirror.
         OSSC_SyncSettings = onSyncSettings,
-        -- Actor script reports that all of its cast timers have drained and it
-        -- is safe to remove it (see the safe-detach protocol above).
+        -- Safe-detach ack.
         OSSC_ReadyToDetach = onReadyToDetach,
-        -- A mod may also send the pause straight to the actor:
-        --   actor:sendEvent('OSSC_SetCasterPaused', { paused = true, reason = 'my-mod' })
-        -- It reaches the same handler the global route uses.
         OSSC_PMMTeleport = onPMMTeleport,
         OSSC_ConsumeScroll = onConsumeScroll,
         OSSC_ConsumeCharge = onConsumeCharge,
-        -- ── I.OSSC_Casters: spell filter + on-demand casts ─────────────────
-        -- A caster script asks for the current spell filter when it attaches
-        -- (or after a load); the answer goes only to the asking actor.
+        -- ── I.OSSC_Casters events ──
         OSSC_RequestIgnoredSpells = function(data)
             local actor = data and data.actor
             if not (actor and actor.isValid and actor:isValid()) then return end
@@ -899,16 +974,136 @@ return {
                 ids = ignoredSpellList(),
             })
         end,
-        -- The player script forwards I.OSSC.setSpellIgnored here (the list is
-        -- owned by this script, so one mod's veto is visible to every caster).
+        -- Forwarded from I.OSSC.setSpellIgnored.
         OSSC_SetSpellIgnored = function(data)
             if type(data) ~= 'table' then return end
             setSpellIgnored(data.spellId, data.ignored ~= false)
         end,
-        -- Mods without access to the global interface can use the event form:
-        --   core.sendGlobalEvent('OSSC_CastSpellAtTarget', { caster=..., spellId=..., target=... })
+        -- Event form of castSpellAtTarget.
         OSSC_CastSpellAtTarget = function(data)
             castSpellAtTarget(data)
+        end,
+        -- A caster quick-cast is about to hit `actor`: make sure it can render
+        -- Spell Framework Plus' hit VFX (see ensureHitVfxHandler).
+        OSSC_EnsureHitVfx = function(data)
+            ensureHitVfxHandler(data and data.actor)
+        end,
+
+        --- Spell Framework Plus broadcasts every magic hit. OSSC listens for the
+        --- ones it asked for (userData.osscImpactVfx, see ossc_impact_vfx.lua)
+        --- and draws their statics the way the PLAYER's own hit is drawn: handed
+        --- to the struck actor's own AddVfx handler, which the global side
+        --- attached before the launch. An impact with no actor to parent the
+        --- static to is spawned in the world at the point the bolt hit, which is
+        --- vanilla's `explodeSpell`.
+        MagExp_OnMagicHit = function(info)
+            if type(info) ~= 'table' or type(info.userData) ~= 'table' then return end
+            local models = info.userData.osscImpactVfx
+            if type(models) ~= 'table' then return end
+            -- ── The two visuals, split the way the engine splits them ──
+            --   * a hit ON AN ACTOR is `CastSpell::playEffects`, which attaches
+            --     that effect's HIT static to the actor's animation;
+            --   * an EXPLOSION is `explodeSpell`, which spawns each exploding
+            --     effect's AREA static at the point the spell landed (SF+'s
+            --     `detonateSpellAtPos`).
+            --
+            -- So an exploding cast is drawn here on a BODY (its hit static,
+            -- next to the explosion blooming at the same point) and nowhere
+            -- else: on the ground or on an object the explosion is the whole
+            -- visual, and a second static there is the "area spell shows
+            -- hitVfx instead of areaVfx" report.
+            --
+            -- A blast VICTIM is never drawn here: `isAoE` means the explosion
+            -- reached this actor as collateral, and a victim's flash is
+            -- ATTACHED ON THE VICTIM BY SF+ ITSELF -- `applySpellToActor` runs
+            -- once per victim with `isAoe == true` and sends the `AddVfx` for
+            -- every effect that reached it, exactly as `explodeSpell` ->
+            -- `inflict(..., exploded=true)` -> `playEffects` does in the engine
+            -- (a listener's `suppressImpactVfx` only ever covers the impact its
+            -- own hit event reports, never the collateral). Drawing the models
+            -- here as well would double every blast victim's flash, so the
+            -- early return stays -- it is what keeps ONE drawer per body.
+            if info.isAoE == true then return end
+            local target = info.target
+            -- Does this cast explode anywhere? The event's own radius answers
+            -- it for a bolt (a launch carries the effect area it resolved); a
+            -- Touch/Self event carries its primary effect's area as well, and
+            -- the record is the fallback for a listener that filled neither.
+            local castExplodes = (tonumber(info.area) or 0) > 0
+            if not castExplodes and type(info.spellId) == 'string' then
+                local enchantments = core.magic.enchantments
+                    and core.magic.enchantments.records or nil
+                local record = core.magic.spells.records[info.spellId]
+                    or (enchantments and enchantments[info.spellId]) or nil
+                castExplodes = record ~= nil and spellArea.explodes(record) == true
+            end
+            -- ── An actor is drawn the way the PLAYER is drawn ──
+            -- The static goes to the struck actor's own AddVfx handler, which
+            -- makes the same `anim.addVfx(self, model, options)` call SFP's
+            -- player script makes — the placement every report has compared
+            -- against ("it lands properly on the player") — so the flash is
+            -- parented to the actor and moves with the body.
+            --
+            -- The one thing that must not be copied verbatim is the effect's
+            -- HEIGHT. OpenMW's `Animation::addEffect` shifts a boneless effect
+            -- by `height - 128` for everything except an NPC, so the Player's
+            -- flash is moved down onto the body by the engine while an NPC's
+            -- is left at the 128-unit reference height the statics are authored
+            -- at — the "spawned way higher than the model" report. That
+            -- correction is applied in the actor's handler
+            -- (ossc_actor_hit_vfx.lua, ossc_body_anchor.attachedOffset), with
+            -- the engine's own sign, so nothing here invents a height.
+            --
+            -- Only a hit the actor cannot interpret falls through to the
+            -- world-space static below: a target whose handler could not be
+            -- attached (see ensureHitVfxHandler), an actor that is no longer
+            -- valid, and every impact that is not on an actor at all — the
+            -- ground, a door, a crate — which vanilla also draws in the world
+            -- (explodeSpell -> spawnEffect) at the point the bolt hit.
+            local attached = false
+            if target ~= nil and target.isValid and target:isValid() and target.enabled
+                and (target.type == types.NPC or target.type == types.Creature)
+                and hitVfxHandlerOf(target) ~= nil then
+                for i = 1, #models do
+                    local entry = models[i]
+                    if type(entry) == 'table' and type(entry.model) == 'string'
+                        and entry.model ~= '' then
+                        target:sendEvent('AddVfx', {
+                            model   = entry.model,
+                            options = { mwMagicVfx = true },
+                        })
+                    end
+                end
+                attached = true
+            end
+            local pos = nil
+            if not attached then
+                -- No handler yet: attach one so the NEXT hit is drawn on the
+                -- body, and draw THIS one where it landed — vanilla's
+                -- `explodeSpell` placement, the only thing left to do when
+                -- nothing on the actor can interpret the event yet (an
+                -- attached script only starts a frame later).
+                -- ...but NOT for an exploding cast that has no BODY to sit on:
+                -- a terrain or object impact of an area spell is drawn by the
+                -- explosion alone.
+                local onBody = target ~= nil and target.isValid ~= nil
+                    and target:isValid() == true
+                    and (target.type == types.NPC or target.type == types.Creature
+                         or target.type == types.Player)
+                if onBody then
+                    ensureHitVfxHandler(target)
+                elseif castExplodes then
+                    return
+                end
+                pos = impactVfx.positionFor(info.hitPos, target)
+                if pos == nil then return end
+                impactVfx.spawn(models, pos)
+            end
+            if debugModeEnabled() then
+                print(string.format('[OSSC Global] Impact VFX: %d static(s) %s',
+                    #models, attached and ('added on ' .. tostring(target.recordId))
+                        or ('spawned at ' .. tostring(pos))))
+            end
         end,
     },
 }

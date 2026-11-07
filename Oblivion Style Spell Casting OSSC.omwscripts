@@ -4,3 +4,4 @@ GLOBAL: scripts/ossc/ossc_global.lua
 CUSTOM: scripts/ossc/ossc_npc.lua
 CUSTOM: scripts/ossc/ossc_creature.lua
 CUSTOM: scripts/ossc/ossc_actor_items.lua
+CUSTOM: scripts/ossc/ossc_actor_hit_vfx.lua

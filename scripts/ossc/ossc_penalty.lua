@@ -1,20 +1,5 @@
--- Shared quick-cast penalty definitions for the OSSC settings, player and
--- actor scripts.
---
--- The select list shown in the settings menu, the set of values the settings
--- migration accepts, and the multiplier the scripts apply are all derived from
--- the same STEP / MAX pair below, so the three can never disagree about which
--- penalties exist or what one means.
---
--- Stored values are 'off', 'reduce_<percent>' or 'skill_based'. The multiplier
--- is the percentage that is LEFT after the penalty, so no penalty is 1.0 and a
--- 25% penalty is 0.75.
---
--- 'skill_based' is the last item of the same select as the flat percentages:
--- the penalty then follows the caster's skill in the cast's school (Enchant
--- for enchanted items) instead of a fixed percentage — see Penalty.skillScale.
--- It used to be a separate checkbox next to each select; the settings script
--- folds a ticked checkbox into the select once (see ossc_settings.lua).
+-- Shared quick-cast penalty definitions (settings, player, actor scripts).
+-- Stored: 'off', 'reduce_<percent>', 'skill_based'. Multiplier = fraction left (25% penalty = 0.75).
 
 local STEP = 5
 local MAX  = 50
@@ -23,12 +8,10 @@ local SKILL_BASED = 'skill_based'
 
 local Penalty = {}
 
--- The stored value of the skill-based choice, for the settings migration and
--- for any script that wants to write it.
+-- Stored skill-based value.
 Penalty.SKILL_BASED = SKILL_BASED
 
--- Select items for the settings renderer: Off, then the flat percentages in
--- ascending penalty order, then Skill based.
+-- Select items: Off, percentages ascending, Skill based.
 Penalty.items = { 'off' }
 
 -- Every value the current release considers valid, keyed by the stored string.
@@ -48,13 +31,7 @@ local function trimmedLower(rawValue)
     return v
 end
 
---- True when a stored value asks for the skill-based penalty.
----
---- Accepts the current 'skill_based' key and the spellings a hand-edited
---- save might carry ('skill', 'skill based', 'skill-based', 'skillbased').
---- Callers must resolve a skill-based value through Penalty.skillScale with
---- the caster's skill; Penalty.scale cannot know the skill and treats the
---- value as no penalty.
+-- True for skill-based values (incl. legacy spellings). Resolve via Penalty.skillScale.
 function Penalty.isSkillBased(rawValue)
     if rawValue == nil then return false end
     local v = trimmedLower(rawValue)
@@ -65,17 +42,14 @@ function Penalty.isSkillBased(rawValue)
         or v == 'skill-based'
 end
 
---- The multiplier for a penalty given as a percentage.
---- Values outside 0..MAX are clamped rather than rejected: a hand-edited save
---- asking for more than the menu offers should still behave sensibly.
+-- Multiplier for a percentage, clamped to 0..MAX.
 function Penalty.scaleFromPercent(pct)
     if type(pct) ~= 'number' or pct <= 0 then return 1.0 end
     if pct > MAX then pct = MAX end
     return (100 - pct) / 100
 end
 
---- The multiplier for the skill-based penalty: 0 skill is a 50% penalty,
---- 100+ skill is no penalty, linear in between (50 skill → 25% penalty).
+-- 0 skill = 50% penalty, 100+ = none, linear.
 function Penalty.skillScale(skillValue)
     local s = tonumber(skillValue) or 0
     if s < 0 then s = 0 end
@@ -83,16 +57,8 @@ function Penalty.skillScale(skillValue)
     return (100 - 50 * (1 - s / 100)) / 100
 end
 
---- The multiplier for a value exactly as it is stored in player storage.
----
---- Accepts the current 'off' / 'reduce_<percent>' keys, and the forms older
---- releases wrote: the select index (0 = off, 1 = 25%, 2 = 50%), a bare or
---- signed percentage string, and the 'ossc_penalty_*' keys. Anything
---- unrecognised falls back to no penalty rather than to a guess.
----
---- The skill-based choice is not a fixed multiplier and is answered as no
---- penalty here: check Penalty.isSkillBased first and use Penalty.skillScale
---- with the caster's skill when it is set.
+-- Multiplier for a stored value, incl. legacy forms; unknown = no penalty.
+-- Skill-based reads as no penalty: check isSkillBased first.
 function Penalty.scale(rawValue)
     if rawValue == nil then return 1.0 end
 
@@ -118,11 +84,7 @@ function Penalty.scale(rawValue)
     return 1.0
 end
 
---- The multiplier for a stored value, with the skill-based choice resolved.
----
---- `skillValue` is the caster's skill in the cast's school (or Enchant for an
---- enchanted item); it is only consulted when the value is skill-based, so
---- callers that already know the value is flat may pass nil.
+-- Multiplier with skill-based resolved; skillValue only used when skill-based.
 function Penalty.resolve(rawValue, skillValue)
     if Penalty.isSkillBased(rawValue) then
         return Penalty.skillScale(skillValue)
@@ -130,22 +92,9 @@ function Penalty.resolve(rawValue, skillValue)
     return Penalty.scale(rawValue)
 end
 
--- ── Shield Casting Penalty ──────────────────────────────────────────────────
--- A different animal from the two above: the shield penalty is a cast-speed
--- slowdown computed from the equipped shield's weight against the caster's
--- Strength and cast skill (the Carry-Capacity Ratio formula in the player and
--- NPC scripts). The setting decides how much of that computed slowdown is
--- applied — its STRENGTH:
---
---   'off'          nothing
---   'shield_<n>'   n% of the formula's slowdown; 100 is the whole of it (the
---                  old 'full'), 50 is half (the old 'reduced')
---   'skill_based'  the strength follows the cast skill: 0 skill → 100%,
---                  100+ skill → 0%, linear in between (50 skill → the old
---                  'reduced' half)
---
--- Stored values other than these are the ones older releases wrote ('reduced',
--- 'full', the skill-based checkbox that the settings script folds in).
+-- ── Shield Casting Penalty ──
+-- Strength (0..1) of the shield cast-speed slowdown.
+-- Stored: 'off', 'shield_<n>' (n%), 'skill_based'; legacy 'reduced'/'full'.
 
 local SHIELD_STEP = 10
 local SHIELD_MAX  = 100
@@ -153,8 +102,7 @@ local SHIELD_MAX  = 100
 local Shield = {}
 Penalty.shield = Shield
 
--- Select items for the settings renderer: Off, the strengths in ascending
--- order, then Skill based.
+-- Select items: Off, strengths ascending, Skill based.
 Shield.items = { 'off' }
 
 -- Every value the current release considers valid, keyed by the stored string.
@@ -169,8 +117,7 @@ end
 Shield.items[#Shield.items + 1] = SKILL_BASED
 Shield.valid[SKILL_BASED] = true
 
---- The stored key for a strength given as a percentage, snapped to the
---- nearest step the menu offers (0 → 'off').
+-- Stored key for a percentage, snapped to the nearest step.
 function Shield.keyFromPercent(pct)
     pct = tonumber(pct) or 0
     if pct <= 0 then return 'off' end
@@ -180,13 +127,7 @@ function Shield.keyFromPercent(pct)
     return 'shield_' .. stepped
 end
 
---- The strength (0..1) of the shield penalty for a stored value.
----
---- Accepts the current keys, the old 'reduced' / 'full' words, and a bare or
---- '%'-suffixed percentage. Anything unrecognised — and the skill-based
---- choice, which is not a fixed strength: check Penalty.isSkillBased first
---- and use Shield.skillStrength with the caster's skill — reads as 0, i.e.
---- no penalty rather than a guess.
+-- Strength for a stored value; unknown or skill-based reads as 0.
 function Shield.strength(rawValue)
     if rawValue == nil then return 0 end
     local v = trimmedLower(rawValue)
@@ -203,8 +144,7 @@ function Shield.strength(rawValue)
     return pct / 100
 end
 
---- The strength for the skill-based choice: 0 skill → 1.0 (the whole
---- slowdown), 100+ skill → 0 (none), linear in between.
+-- 0 skill = 1.0, 100+ = 0, linear.
 function Shield.skillStrength(skillValue)
     local s = tonumber(skillValue) or 0
     if s < 0 then s = 0 end
@@ -212,9 +152,7 @@ function Shield.skillStrength(skillValue)
     return 1 - s / 100
 end
 
---- The strength for a stored value, with the skill-based choice resolved
---- through `skillValue` (the caster's skill in the cast's school, or Enchant
---- for an enchanted item).
+-- Strength with skill-based resolved.
 function Shield.resolve(rawValue, skillValue)
     if Penalty.isSkillBased(rawValue) then
         return Shield.skillStrength(skillValue)
@@ -222,10 +160,7 @@ function Shield.resolve(rawValue, skillValue)
     return Shield.strength(rawValue)
 end
 
---- The current select item for a value exactly as stored in player storage:
---- 'reduced' → 'shield_50', 'full' → 'shield_100', the skill-based spellings
---- → 'skill_based', a percentage → the nearest step, anything unrecognised →
---- 'off' (the setting's default).
+-- Normalize a stored value to a current select item; unknown = 'off'.
 function Shield.normalize(rawValue)
     if rawValue == nil then return 'off' end
     local v = trimmedLower(rawValue)
